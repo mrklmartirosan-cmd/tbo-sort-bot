@@ -80,13 +80,13 @@ async def recognize_photo(image_bytes: bytes) -> dict:
 {
   "дата": "дд.мм.гггг",
   "фио": "ФИО оператора",
-  "вес_шин": число,
-  "фракция_0_1": число,
-  "фракция_1_2": число,
-  "фракция_2_4": число,
-  "фракция_4_6": число,
-  "фракция_6_8": число,
-  "металл_корд": число,
+  "вес_шин": 0,
+  "фракция_0_1": 0,
+  "фракция_1_2": 0,
+  "фракция_2_4": 0,
+  "фракция_4_6": 0,
+  "фракция_6_8": 0,
+  "металл_корд": 0,
   "примечание": ""
 }
 Если значение не читается — поставь 0."""
@@ -111,8 +111,7 @@ async def recognize_photo(image_bytes: bytes) -> dict:
             }
         )
         result = response.json()
-        content = result.get("content", result) if isinstance(result, dict) else result
-text = content[0]["text"].strip() if isinstance(content, list) else content["text"].strip()
+        text = result["content"][0]["text"].strip()
         text = re.sub(r'```json|```', '', text).strip()
         return json.loads(text)
 
