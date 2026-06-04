@@ -13,7 +13,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = "8301597645:AAFWoWUYRDHMI1U7FoZKKCOmXDnrESduSrQ"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 EXCEL_FILE = "uchet_kroshki_bot.xlsx"
 
