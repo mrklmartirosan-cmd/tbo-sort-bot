@@ -76,10 +76,13 @@ def save_to_excel(data):
     wb.save(EXCEL_FILE)
 
 
-async def recognize_photo(image_bytes: bytes) -> dict:
+async def recognize_photo(image_bytes: bytes):
     image_b64 = base64.b64encode(image_bytes).decode()
     prompt = """Это фото ежедневного отчёта по производству резиновой крошки.
-Распознай все данные и верни ТОЛЬКО JSON без пояснений и без markdown:
+На фото может быть одна или несколько строк отчёта.
+Распознай все строки и верни ТОЛЬКО JSON без пояснений и без markdown.
+Если строка одна — верни объект. Если строк несколько — верни массив объектов.
+Формат каждой записи:
 {
   "дата": "дд.мм.гггг",
   "фио": "ФИО оператора",
@@ -103,7 +106,7 @@ async def recognize_photo(image_bytes: bytes) -> dict:
             },
             json={
                 "model": "claude-opus-4-5",
-                "max_tokens": 1000,
+                "max_tokens": 2000,
                 "messages": [{
                     "role": "user",
                     "content": [
@@ -165,19 +168,30 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image_bytes = await file.download_as_bytearray()
         data = await recognize_photo(bytes(image_bytes))
         logger.info(f"Parsed data: {data}")
-        save_to_excel(data)
+
+        if isinstance(data, list):
+            for item in data:
+                save_to_excel(item)
+            first = data[0]
+            count = len(data)
+        else:
+            save_to_excel(data)
+            first = data
+            count = 1
+
         reply = (
-            f"✅ *Данные распознаны и сохранены!*\n\n"
-            f"📅 Дата: {data.get('дата', '—')}\n"
-            f"👤 Оператор: {data.get('фио', '—')}\n"
-            f"⚖️ Вес шин: {data.get('вес_шин', 0)} кг\n\n"
+            f"✅ *Данные распознаны и сохранены!*\n"
+            f"_Записей сохранено: {count}_\n\n"
+            f"📅 Дата: {first.get('дата', '—')}\n"
+            f"👤 Оператор: {first.get('фио', '—')}\n"
+            f"⚖️ Вес шин: {first.get('вес_шин', 0)} кг\n\n"
             f"*Фракции (кг):*\n"
-            f"  0-1: {data.get('фракция_0_1', 0)}\n"
-            f"  1-2: {data.get('фракция_1_2', 0)}\n"
-            f"  2-4: {data.get('фракция_2_4', 0)}\n"
-            f"  4-6: {data.get('фракция_4_6', 0)}\n"
-            f"  6-8: {data.get('фракция_6_8', 0)}\n\n"
-            f"🔩 Металлокорд: {data.get('металл_корд', 0)} кг\n\n"
+            f"  0-1: {first.get('фракция_0_1', 0)}\n"
+            f"  1-2: {first.get('фракция_1_2', 0)}\n"
+            f"  2-4: {first.get('фракция_2_4', 0)}\n"
+            f"  4-6: {first.get('фракция_4_6', 0)}\n"
+            f"  6-8: {first.get('фракция_6_8', 0)}\n\n"
+            f"🔩 Металлокорд: {first.get('металл_корд', 0)} кг\n\n"
             f"_Если что-то неверно — напиши мне_"
         )
         await update.message.reply_text(reply, parse_mode="Markdown")
