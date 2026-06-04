@@ -111,7 +111,8 @@ async def recognize_photo(image_bytes: bytes) -> dict:
             }
         )
         result = response.json()
-        text = result["content"][0]["text"].strip()
+        content = result.get("content", result) if isinstance(result, dict) else result
+text = content[0]["text"].strip() if isinstance(content, list) else content["text"].strip()
         text = re.sub(r'```json|```', '', text).strip()
         return json.loads(text)
 
