@@ -4,8 +4,8 @@ import base64
 import logging
 import re
 from datetime import datetime
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 import httpx
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -18,17 +18,25 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "8301597645:AAH1YI80SUG0439UJTHqyw8jhsPf
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 PORT = int(os.environ.get("PORT", 8080))
-EXCEL_FILE = "uchet_kroshki_bot.xlsx"
+
+PRODUCTION_FILE = "uchet_kroshki.xlsx"
+SALES_FILE = "uchet_realizacii.xlsx"
+
+WAITING_PHOTO_TYPE = 1
 
 
-def get_or_create_excel():
-    if os.path.exists(EXCEL_FILE):
-        return load_workbook(EXCEL_FILE)
+def make_border():
+    thin = Side(style='thin', color='AAAAAA')
+    return Border(left=thin, right=thin, top=thin, bottom=thin)
+
+
+def get_or_create_production():
+    if os.path.exists(PRODUCTION_FILE):
+        return load_workbook(PRODUCTION_FILE)
     wb = Workbook()
     ws = wb.active
     ws.title = "Журнал"
-    thin = Side(style='thin', color='AAAAAA')
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    border = make_border()
     headers = ["Дата", "ФИО оператора", "Вес шин, кг", "Фракция 0-1", "Фракция 1-2",
                "Фракция 2-4", "Фракция 4-6", "Фракция 6-8", "Всего крошки, кг", "Металл. корд, кг", "Примечание"]
     for col, h in enumerate(headers, 1):
@@ -39,18 +47,49 @@ def get_or_create_excel():
         c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         c.border = border
     ws.row_dimensions[1].height = 36
-    col_widths = [12, 20, 12, 11, 11, 11, 11, 11, 14, 13, 18]
-    for i, w in enumerate(col_widths, 1):
+    for i, w in enumerate([12, 20, 12, 11, 11, 11, 11, 11, 14, 13, 18], 1):
         ws.column_dimensions[get_column_letter(i)].width = w
-    wb.save(EXCEL_FILE)
+    wb.save(PRODUCTION_FILE)
     return wb
 
 
-def save_to_excel(data):
-    wb = get_or_create_excel()
+def get_or_create_sales():
+    if os.path.exists(SALES_FILE):
+        return load_workbook(SALES_FILE)
+    wb = Workbook()
     ws = wb.active
-    thin = Side(style='thin', color='AAAAAA')
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    ws.title = "Реализация"
+    border = make_border()
+    headers = ["Дата", "Покупатель", "Фракция", "Количество, т", "Количество, кг", "Сумма, тнг", "Примечание"]
+    for col, h in enumerate(headers, 1):
+        c = ws.cell(row=1, column=col)
+        c.value = h
+        c.font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+        c.fill = PatternFill("solid", fgColor="1E7145")
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = border
+    ws.row_dimensions[1].height = 36
+    for i, w in enumerate([12, 25, 15, 14, 14, 16, 20], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    wb.save(SALES_FILE)
+    return wb
+
+
+def get_existing_dates_production():
+    wb = get_or_create_production()
+    ws = wb.active
+    dates = set()
+    for row in range(2, ws.max_row + 1):
+        val = ws.cell(row=row, column=1).value
+        if val:
+            dates.add(str(val).strip())
+    return dates
+
+
+def save_production(data):
+    wb = get_or_create_production()
+    ws = wb.active
+    border = make_border()
     next_row = ws.max_row + 1
     shade = "F2F2F2" if next_row % 2 == 0 else "FFFFFF"
     values = [
@@ -73,29 +112,87 @@ def save_to_excel(data):
         c.fill = PatternFill("solid", fgColor=shade)
         c.alignment = Alignment(horizontal="center", vertical="center")
         c.border = border
-    wb.save(EXCEL_FILE)
+    wb.save(PRODUCTION_FILE)
 
 
-async def recognize_photo(image_bytes: bytes):
+def save_sale(data):
+    wb = get_or_create_sales()
+    ws = wb.active
+    border = make_border()
+    next_row = ws.max_row + 1
+    shade = "F2F2F2" if next_row % 2 == 0 else "FFFFFF"
+    qty_t = data.get("количество_т", 0)
+    qty_kg = float(qty_t) * 1000 if qty_t else data.get("количество_кг", 0)
+    values = [
+        data.get("дата", datetime.now().strftime("%d.%m.%Y")),
+        data.get("покупатель", ""),
+        data.get("фракция", ""),
+        qty_t,
+        qty_kg,
+        data.get("сумма", ""),
+        data.get("примечание", ""),
+    ]
+    for col, val in enumerate(values, 1):
+        c = ws.cell(row=next_row, column=col)
+        c.value = val
+        c.font = Font(name="Arial", size=10)
+        c.fill = PatternFill("solid", fgColor=shade)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border = border
+    wb.save(SALES_FILE)
+
+
+def calc_stock():
+    # Приход по фракциям из производства
+    income = {"0-1": 0, "1-2": 0, "2-4": 0, "4-6": 0, "6-8": 0}
+    wb_p = get_or_create_production()
+    ws_p = wb_p.active
+    for row in range(2, ws_p.max_row + 1):
+        for i, key in enumerate(["0-1", "1-2", "2-4", "4-6", "6-8"], 4):
+            val = ws_p.cell(row=row, column=i).value
+            try:
+                income[key] += float(val) if val else 0
+            except:
+                pass
+
+    # Расход из реализации
+    outcome = {"0-1": 0, "1-2": 0, "2-4": 0, "4-6": 0, "6-8": 0}
+    wb_s = get_or_create_sales()
+    ws_s = wb_s.active
+    for row in range(2, ws_s.max_row + 1):
+        frac = ws_s.cell(row=row, column=3).value or ""
+        qty_kg = ws_s.cell(row=row, column=5).value or 0
+        for key in outcome:
+            if key in str(frac):
+                try:
+                    outcome[key] += float(qty_kg)
+                except:
+                    pass
+
+    stock = {k: income[k] - outcome[k] for k in income}
+    return income, outcome, stock
+
+
+async def recognize_production(image_bytes: bytes):
     image_b64 = base64.b64encode(image_bytes).decode()
     prompt = """Это фото ежедневного отчёта по производству резиновой крошки.
-На фото может быть одна или несколько строк отчёта.
-Распознай все строки и верни ТОЛЬКО JSON без пояснений и без markdown.
-Если строка одна — верни объект. Если строк несколько — верни массив объектов.
-Формат каждой записи:
-{
-  "дата": "дд.мм.гггг",
-  "фио": "ФИО оператора",
-  "вес_шин": 0,
-  "фракция_0_1": 0,
-  "фракция_1_2": 0,
-  "фракция_2_4": 0,
-  "фракция_4_6": 0,
-  "фракция_6_8": 0,
-  "металл_корд": 0,
-  "примечание": ""
-}
-Если значение не читается — поставь 0."""
+На фото может быть одна или несколько строк. Верни ТОЛЬКО JSON без markdown.
+Если одна строка — объект, если несколько — массив объектов. Формат:
+{"дата":"дд.мм.гггг","фио":"ФИО","вес_шин":0,"фракция_0_1":0,"фракция_1_2":0,"фракция_2_4":0,"фракция_4_6":0,"фракция_6_8":0,"металл_корд":0,"примечание":""}
+Если не читается — 0."""
+    return await call_claude(image_b64, prompt)
+
+
+async def recognize_sale(image_bytes: bytes):
+    image_b64 = base64.b64encode(image_bytes).decode()
+    prompt = """Это фото накладной на отпуск/реализацию резиновой крошки.
+Распознай данные и верни ТОЛЬКО JSON без markdown:
+{"дата":"дд.мм.гггг","покупатель":"название","фракция":"2-4","количество_т":0.0,"количество_кг":0,"сумма":0,"примечание":""}
+Количество в тоннах бери из колонки "отпущено". Если не читается — 0."""
+    return await call_claude(image_b64, prompt)
+
+
+async def call_claude(image_b64: str, prompt: str):
     async with httpx.AsyncClient(timeout=60) as client:
         response = await client.post(
             "https://api.anthropic.com/v1/messages",
@@ -117,102 +214,168 @@ async def recognize_photo(image_bytes: bytes):
             }
         )
         result = response.json()
-        logger.info(f"Anthropic response: {result}")
+        logger.info(f"Claude response: {result}")
         text = result["content"][0]["text"].strip()
         text = re.sub(r'```json|```', '', text).strip()
         return json.loads(text)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [["📸 Производство", "📄 Реализация"]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text(
-        "👋 Привет! Я бот учёта производства резиновой крошки.\n\n"
-        "📸 Отправь фото ежедневного отчёта — распознаю и сохраню в таблицу.\n\n"
-        "📊 Команды:\n"
-        "/get — скачать Excel таблицу\n"
-        "/last — последние 5 записей"
+        "👋 Привет! Я бот учёта резиновой крошки.\n\n"
+        "Выбери тип фото или используй команды:\n"
+        "/ostatok — остаток на складе\n"
+        "/get — скачать таблицы\n"
+        "/last — последние записи",
+        reply_markup=reply_markup
     )
 
 
-async def get_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    get_or_create_excel()
-    with open(EXCEL_FILE, "rb") as f:
-        await update.message.reply_document(
-            document=f,
-            filename=f"uchet_kroshki_{datetime.now().strftime('%d%m%Y')}.xlsx",
-            caption="📊 Текущая таблица учёта"
-        )
+async def ostatok(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    income, outcome, stock = calc_stock()
+    total_in = sum(income.values())
+    total_out = sum(outcome.values())
+    total_stock = sum(stock.values())
+
+    text = "📦 *ОСТАТОК НА СКЛАДЕ*\n\n"
+    text += "```\n"
+    text += f"{'Фракция':<10} {'Приход':>10} {'Расход':>10} {'Остаток':>10}\n"
+    text += "-" * 44 + "\n"
+    for key in ["0-1", "1-2", "2-4", "4-6", "6-8"]:
+        text += f"{key:<10} {income[key]:>10.0f} {outcome[key]:>10.0f} {stock[key]:>10.0f}\n"
+    text += "-" * 44 + "\n"
+    text += f"{'ИТОГО':<10} {total_in:>10.0f} {total_out:>10.0f} {total_stock:>10.0f}\n"
+    text += "```\n"
+    text += f"_Все данные в кг_"
+
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def get_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    date_str = datetime.now().strftime('%d%m%Y')
+    for filepath, caption in [
+        (PRODUCTION_FILE, "📊 Журнал производства"),
+        (SALES_FILE, "📄 Журнал реализации")
+    ]:
+        get_or_create_production() if "kroshki" in filepath else get_or_create_sales()
+        if os.path.exists(filepath):
+            with open(filepath, "rb") as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename=f"{filepath.replace('.xlsx', '')}_{date_str}.xlsx",
+                    caption=caption
+                )
 
 
 async def last_records(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    wb = get_or_create_excel()
+    wb = get_or_create_production()
     ws = wb.active
     max_row = ws.max_row
     if max_row <= 1:
         await update.message.reply_text("📭 Записей пока нет.")
         return
     start_row = max(2, max_row - 4)
-    text = "📋 *Последние записи:*\n\n"
+    text = "📋 *Последние записи производства:*\n\n"
     for row in range(start_row, max_row + 1):
         date = ws.cell(row=row, column=1).value or "—"
         fio = ws.cell(row=row, column=2).value or "—"
         total = ws.cell(row=row, column=9).value or "—"
-        text += f"📅 {date} | {fio} | Крошка: {total} кг\n"
+        text += f"📅 {date} | {fio} | {total} кг\n"
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "📸 Производство":
+        context.user_data["photo_type"] = "production"
+        await update.message.reply_text("📸 Отправь фото отчёта по производству крошки.")
+    elif text == "📄 Реализация":
+        context.user_data["photo_type"] = "sale"
+        await update.message.reply_text("📄 Отправь фото накладной на реализацию.")
+    else:
+        await update.message.reply_text("Используй кнопки меню или команды /ostatok, /get, /last")
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    photo_type = context.user_data.get("photo_type", "production")
     await update.message.reply_text("📸 Получил фото, распознаю данные...")
+
     try:
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
-        image_bytes = await file.download_as_bytearray()
-        data = await recognize_photo(bytes(image_bytes))
-        logger.info(f"Parsed data: {data}")
+        image_bytes = bytes(await file.download_as_bytearray())
 
-        if isinstance(data, list):
-            for item in data:
-                save_to_excel(item)
-            first = data[0]
-            count = len(data)
+        if photo_type == "sale":
+            # Реализация
+            data = await recognize_sale(image_bytes)
+            logger.info(f"Sale data: {data}")
+            save_sale(data)
+            qty_kg = float(data.get("количество_т", 0)) * 1000
+            reply = (
+                f"✅ *Реализация сохранена!*\n\n"
+                f"📅 Дата: {data.get('дата', '—')}\n"
+                f"🏢 Покупатель: {data.get('покупатель', '—')}\n"
+                f"📦 Фракция: {data.get('фракция', '—')}\n"
+                f"⚖️ Количество: {data.get('количество_т', 0)} т ({qty_kg:.0f} кг)\n"
+                f"💰 Сумма: {data.get('сумма', 0)} тнг"
+            )
+            await update.message.reply_text(reply, parse_mode="Markdown")
+
         else:
-            save_to_excel(data)
-            first = data
-            count = 1
+            # Производство
+            data = await recognize_production(image_bytes)
+            logger.info(f"Production data: {data}")
+            existing_dates = get_existing_dates_production()
+            records = data if isinstance(data, list) else [data]
+            new_records = [r for r in records if str(r.get("дата", "")).strip() not in existing_dates]
+            skipped = len(records) - len(new_records)
 
-        reply = (
-            f"✅ *Данные распознаны и сохранены!*\n"
-            f"_Записей сохранено: {count}_\n\n"
-            f"📅 Дата: {first.get('дата', '—')}\n"
-            f"👤 Оператор: {first.get('фио', '—')}\n"
-            f"⚖️ Вес шин: {first.get('вес_шин', 0)} кг\n\n"
-            f"*Фракции (кг):*\n"
-            f"  0-1: {first.get('фракция_0_1', 0)}\n"
-            f"  1-2: {first.get('фракция_1_2', 0)}\n"
-            f"  2-4: {first.get('фракция_2_4', 0)}\n"
-            f"  4-6: {first.get('фракция_4_6', 0)}\n"
-            f"  6-8: {first.get('фракция_6_8', 0)}\n\n"
-            f"🔩 Металлокорд: {first.get('металл_корд', 0)} кг\n\n"
-            f"_Если что-то неверно — напиши мне_"
-        )
-        await update.message.reply_text(reply, parse_mode="Markdown")
+            if not new_records:
+                await update.message.reply_text("⚠️ Все записи с этого фото уже есть в таблице.")
+                return
+
+            for item in new_records:
+                save_production(item)
+
+            first = new_records[-1]
+            reply = (
+                f"✅ *Производство сохранено!*\n"
+                f"_Новых: {len(new_records)}"
+                + (f" | Дублей пропущено: {skipped}" if skipped > 0 else "") +
+                "_\n\n"
+                f"📅 Дата: {first.get('дата', '—')}\n"
+                f"👤 Оператор: {first.get('фио', '—')}\n"
+                f"⚖️ Вес шин: {first.get('вес_шин', 0)} кг\n\n"
+                f"*Фракции (кг):*\n"
+                f"  0-1: {first.get('фракция_0_1', 0)}\n"
+                f"  1-2: {first.get('фракция_1_2', 0)}\n"
+                f"  2-4: {first.get('фракция_2_4', 0)}\n"
+                f"  4-6: {first.get('фракция_4_6', 0)}\n"
+                f"  6-8: {first.get('фракция_6_8', 0)}\n\n"
+                f"🔩 Металлокорд: {first.get('металл_корд', 0)} кг"
+            )
+            await update.message.reply_text(reply, parse_mode="Markdown")
+
+        # Сбрасываем тип
+        context.user_data["photo_type"] = "production"
+
     except Exception as e:
         logger.error(f"Error: {e}")
         await update.message.reply_text(
-            "❌ Не смог распознать. Попробуй:\n"
+            "❌ Не смог распознать фото. Попробуй:\n"
             "• Сделать фото чётче\n"
             "• Хорошее освещение\n"
             "• Всё в кадре"
         )
 
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📸 Отправь фото отчёта или используй /get для скачивания таблицы.")
-
-
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("get", get_excel))
+    app.add_handler(CommandHandler("ostatok", ostatok))
+    app.add_handler(CommandHandler("get", get_files))
     app.add_handler(CommandHandler("last", last_records))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
