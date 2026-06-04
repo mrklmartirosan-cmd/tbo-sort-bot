@@ -15,10 +15,11 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8301597645:AAH1YI80SUG0439UJTHqyw8jhsPfNydgWrg")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "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")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 PORT = int(os.environ.get("PORT", 8080))
 EXCEL_FILE = "uchet_kroshki_bot.xlsx"
+
 
 def get_or_create_excel():
     if os.path.exists(EXCEL_FILE):
@@ -44,7 +45,8 @@ def get_or_create_excel():
     wb.save(EXCEL_FILE)
     return wb
 
-def logger.info(f"Parsed data: {data}") save_to_excel(data: dict):
+
+def save_to_excel(data):
     wb = get_or_create_excel()
     ws = wb.active
     thin = Side(style='thin', color='AAAAAA')
@@ -72,6 +74,7 @@ def logger.info(f"Parsed data: {data}") save_to_excel(data: dict):
         c.alignment = Alignment(horizontal="center", vertical="center")
         c.border = border
     wb.save(EXCEL_FILE)
+
 
 async def recognize_photo(image_bytes: bytes) -> dict:
     image_b64 = base64.b64encode(image_bytes).decode()
@@ -111,9 +114,11 @@ async def recognize_photo(image_bytes: bytes) -> dict:
             }
         )
         result = response.json()
+        logger.info(f"Anthropic response: {result}")
         text = result["content"][0]["text"].strip()
         text = re.sub(r'```json|```', '', text).strip()
         return json.loads(text)
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -124,6 +129,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/last — последние 5 записей"
     )
 
+
 async def get_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     get_or_create_excel()
     with open(EXCEL_FILE, "rb") as f:
@@ -132,6 +138,7 @@ async def get_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             filename=f"uchet_kroshki_{datetime.now().strftime('%d%m%Y')}.xlsx",
             caption="📊 Текущая таблица учёта"
         )
+
 
 async def last_records(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wb = get_or_create_excel()
@@ -149,6 +156,7 @@ async def last_records(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"📅 {date} | {fio} | Крошка: {total} кг\n"
     await update.message.reply_text(text, parse_mode="Markdown")
 
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📸 Получил фото, распознаю данные...")
     try:
@@ -156,6 +164,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file = await context.bot.get_file(photo.file_id)
         image_bytes = await file.download_as_bytearray()
         data = await recognize_photo(bytes(image_bytes))
+        logger.info(f"Parsed data: {data}")
         save_to_excel(data)
         reply = (
             f"✅ *Данные распознаны и сохранены!*\n\n"
@@ -181,8 +190,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Всё в кадре"
         )
 
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📸 Отправь фото отчёта или используй /get для скачивания таблицы.")
+
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -204,6 +215,7 @@ def main():
     else:
         logger.info("Starting polling...")
         app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
