@@ -4,8 +4,8 @@ import base64
 import logging
 import re
 from datetime import datetime
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import httpx
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -21,8 +21,6 @@ PORT = int(os.environ.get("PORT", 8080))
 
 PRODUCTION_FILE = "uchet_kroshki.xlsx"
 SALES_FILE = "uchet_realizacii.xlsx"
-
-WAITING_PHOTO_TYPE = 1
 
 
 def make_border():
@@ -60,7 +58,8 @@ def get_or_create_sales():
     ws = wb.active
     ws.title = "Реализация"
     border = make_border()
-    headers = ["Дата", "Покупатель", "Фракция", "Количество, т", "Количество, кг", "Сумма, тнг", "Примечание"]
+    headers = ["Дата", "Покупатель", "Фракция", "Количество, т", "Количество, кг",
+               "Сумма с НДС, тнг", "Сумма НДС, тнг", "Примечание"]
     for col, h in enumerate(headers, 1):
         c = ws.cell(row=1, column=col)
         c.value = h
@@ -69,7 +68,7 @@ def get_or_create_sales():
         c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         c.border = border
     ws.row_dimensions[1].height = 36
-    for i, w in enumerate([12, 25, 15, 14, 14, 16, 20], 1):
+    for i, w in enumerate([12, 25, 15, 14, 14, 18, 16, 20], 1):
         ws.column_dimensions[get_column_letter(i)].width = w
     wb.save(SALES_FILE)
     return wb
@@ -129,7 +128,8 @@ def save_sale(data):
         data.get("фракция", ""),
         qty_t,
         qty_kg,
-        data.get("сумма", ""),
+        data.get("сумма_с_ндс", ""),
+        data.get("сумма_ндс", ""),
         data.get("примечание", ""),
     ]
     for col, val in enumerate(values, 1):
@@ -143,7 +143,6 @@ def save_sale(data):
 
 
 def calc_stock():
-    # Приход по фракциям из производства
     income = {"0-1": 0, "1-2": 0, "2-4": 0, "4-6": 0, "6-8": 0}
     wb_p = get_or_create_production()
     ws_p = wb_p.active
@@ -155,7 +154,6 @@ def calc_stock():
             except:
                 pass
 
-    # Расход из реализации
     outcome = {"0-1": 0, "1-2": 0, "2-4": 0, "4-6": 0, "6-8": 0}
     wb_s = get_or_create_sales()
     ws_s = wb_s.active
@@ -171,25 +169,6 @@ def calc_stock():
 
     stock = {k: income[k] - outcome[k] for k in income}
     return income, outcome, stock
-
-
-async def recognize_production(image_bytes: bytes):
-    image_b64 = base64.b64encode(image_bytes).decode()
-    prompt = """Это фото ежедневного отчёта по производству резиновой крошки.
-На фото может быть одна или несколько строк. Верни ТОЛЬКО JSON без markdown.
-Если одна строка — объект, если несколько — массив объектов. Формат:
-{"дата":"дд.мм.гггг","фио":"ФИО","вес_шин":0,"фракция_0_1":0,"фракция_1_2":0,"фракция_2_4":0,"фракция_4_6":0,"фракция_6_8":0,"металл_корд":0,"примечание":""}
-Если не читается — 0."""
-    return await call_claude(image_b64, prompt)
-
-
-async def recognize_sale(image_bytes: bytes):
-    image_b64 = base64.b64encode(image_bytes).decode()
-    prompt = """Это фото накладной на отпуск/реализацию резиновой крошки.
-Распознай данные и верни ТОЛЬКО JSON без markdown:
-{"дата":"дд.мм.гггг","покупатель":"название","фракция":"2-4","количество_т":0.0,"количество_кг":0,"сумма":0,"примечание":""}
-Количество в тоннах бери из колонки "отпущено". Если не читается — 0."""
-    return await call_claude(image_b64, prompt)
 
 
 async def call_claude(image_b64: str, prompt: str):
@@ -220,14 +199,39 @@ async def call_claude(image_b64: str, prompt: str):
         return json.loads(text)
 
 
+async def recognize_production(image_bytes: bytes):
+    image_b64 = base64.b64encode(image_bytes).decode()
+    prompt = """Это фото ежедневного отчёта по производству резиновой крошки.
+На фото может быть одна или несколько строк. Верни ТОЛЬКО JSON без markdown.
+Если одна строка — объект, если несколько — массив объектов. Формат:
+{"дата":"дд.мм.гггг","фио":"ФИО","вес_шин":0,"фракция_0_1":0,"фракция_1_2":0,"фракция_2_4":0,"фракция_4_6":0,"фракция_6_8":0,"металл_корд":0,"примечание":""}
+Если не читается — 0."""
+    return await call_claude(image_b64, prompt)
+
+
+async def recognize_sale(image_bytes: bytes):
+    image_b64 = base64.b64encode(image_bytes).decode()
+    prompt = """Это фото накладной на отпуск/реализацию резиновой крошки.
+Распознай данные и верни ТОЛЬКО JSON без markdown:
+{"дата":"дд.мм.гггг","покупатель":"название организации или ИП","фракция":"например 2-4","количество_т":0.0,"количество_кг":0,"сумма_с_ндс":0,"сумма_ндс":0,"примечание":""}
+Количество в тоннах бери из колонки "отпущено".
+Сумму с НДС бери из колонки "Сумма с НДС" (полная сумма включая НДС).
+Сумму НДС бери из колонки "Сумма НДС" (только НДС).
+Если не читается — 0."""
+    return await call_claude(image_b64, prompt)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [["📸 Производство", "📄 Реализация"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text(
         "👋 Привет! Я бот учёта резиновой крошки.\n\n"
-        "Выбери тип фото или используй команды:\n"
+        "Выбери тип фото:\n"
+        "📸 Производство — ежедневный отчёт\n"
+        "📄 Реализация — накладная на отгрузку\n\n"
+        "Команды:\n"
         "/ostatok — остаток на складе\n"
-        "/get — скачать таблицы\n"
+        "/get — скачать таблицы Excel\n"
         "/last — последние записи",
         reply_markup=reply_markup
     )
@@ -241,32 +245,31 @@ async def ostatok(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = "📦 *ОСТАТОК НА СКЛАДЕ*\n\n"
     text += "```\n"
-    text += f"{'Фракция':<10} {'Приход':>10} {'Расход':>10} {'Остаток':>10}\n"
-    text += "-" * 44 + "\n"
+    text += f"{'Фракция':<8} {'Приход':>8} {'Расход':>8} {'Остаток':>9}\n"
+    text += "-" * 37 + "\n"
     for key in ["0-1", "1-2", "2-4", "4-6", "6-8"]:
-        text += f"{key:<10} {income[key]:>10.0f} {outcome[key]:>10.0f} {stock[key]:>10.0f}\n"
-    text += "-" * 44 + "\n"
-    text += f"{'ИТОГО':<10} {total_in:>10.0f} {total_out:>10.0f} {total_stock:>10.0f}\n"
-    text += "```\n"
-    text += f"_Все данные в кг_"
+        text += f"{key:<8} {income[key]:>8.0f} {outcome[key]:>8.0f} {stock[key]:>9.0f}\n"
+    text += "-" * 37 + "\n"
+    text += f"{'ИТОГО':<8} {total_in:>8.0f} {total_out:>8.0f} {total_stock:>9.0f}\n"
+    text += "```\n_Все данные в кг_"
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def get_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     date_str = datetime.now().strftime('%d%m%Y')
+    get_or_create_production()
+    get_or_create_sales()
     for filepath, caption in [
         (PRODUCTION_FILE, "📊 Журнал производства"),
         (SALES_FILE, "📄 Журнал реализации")
     ]:
-        get_or_create_production() if "kroshki" in filepath else get_or_create_sales()
-        if os.path.exists(filepath):
-            with open(filepath, "rb") as f:
-                await update.message.reply_document(
-                    document=f,
-                    filename=f"{filepath.replace('.xlsx', '')}_{date_str}.xlsx",
-                    caption=caption
-                )
+        with open(filepath, "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename=f"{filepath.replace('.xlsx', '')}_{date_str}.xlsx",
+                caption=caption
+            )
 
 
 async def last_records(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -308,7 +311,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image_bytes = bytes(await file.download_as_bytearray())
 
         if photo_type == "sale":
-            # Реализация
             data = await recognize_sale(image_bytes)
             logger.info(f"Sale data: {data}")
             save_sale(data)
@@ -319,12 +321,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🏢 Покупатель: {data.get('покупатель', '—')}\n"
                 f"📦 Фракция: {data.get('фракция', '—')}\n"
                 f"⚖️ Количество: {data.get('количество_т', 0)} т ({qty_kg:.0f} кг)\n"
-                f"💰 Сумма: {data.get('сумма', 0)} тнг"
+                f"💰 Сумма с НДС: {data.get('сумма_с_ндс', 0)} тнг\n"
+                f"💰 Сумма НДС: {data.get('сумма_ндс', 0)} тнг"
             )
             await update.message.reply_text(reply, parse_mode="Markdown")
+            context.user_data["photo_type"] = "production"
 
         else:
-            # Производство
             data = await recognize_production(image_bytes)
             logger.info(f"Production data: {data}")
             existing_dates = get_existing_dates_production()
@@ -357,9 +360,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🔩 Металлокорд: {first.get('металл_корд', 0)} кг"
             )
             await update.message.reply_text(reply, parse_mode="Markdown")
-
-        # Сбрасываем тип
-        context.user_data["photo_type"] = "production"
 
     except Exception as e:
         logger.error(f"Error: {e}")
