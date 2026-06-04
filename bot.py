@@ -14,8 +14,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = "8301597645:AAH1YI80SUG0439UJTHqyw8jhsPfNydgWrg"
-ANTHROPIC_API_KEY = "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"
-EXCEL_FILE = "uchet_kroshki_bot.xlsx"
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "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")
 
 def get_or_create_excel():
     if os.path.exists(EXCEL_FILE):
