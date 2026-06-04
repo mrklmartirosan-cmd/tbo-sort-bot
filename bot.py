@@ -44,7 +44,7 @@ def get_or_create_excel():
     wb.save(EXCEL_FILE)
     return wb
 
-def save_to_excel(data: dict):
+def logger.info(f"Parsed data: {data}") save_to_excel(data: dict):
     wb = get_or_create_excel()
     ws = wb.active
     thin = Side(style='thin', color='AAAAAA')
