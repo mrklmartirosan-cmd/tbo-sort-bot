@@ -22,14 +22,39 @@ PORT = int(os.environ.get("PORT", 8080))
 
 # --- Google Sheets ---
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
+REPORT_SPREADSHEET_ID = os.environ.get("REPORT_SPREADSHEET_ID", "")  # NEW: файл "Реализация 2026г"
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")  # содержимое JSON-ключа целиком
 
 SHEET_PRODUCTION = "Производство"
 SHEET_SALES = "Реализация"
 
+# NEW: настройки отчёта реализации ---------------------------------
+REPORT_TEMPLATE = "ШАБЛОН"                 # лист-образец (пустой бланк)
+REPORT_DATE_COL = 2                        # B = Дата
+REPORT_BUYER_COL = 3                       # C = Контрагент
+# Для каждой фракции: (Кол-во, Цена, Сумма) — номера столбцов (1-based)
+REPORT_FRAC_COLS = {
+    "0-1": (4, 5, 6),     # D E F
+    "1-2": (7, 8, 9),     # G H I
+    "2-4": (10, 11, 12),  # J K L
+    "4-6": (13, 14, 15),  # M N O
+    "6-8": (16, 17, 18),  # P Q R
+}
+# Блоки (строки данных, без строки "Итого")
+REPORT_BLOCKS = {
+    "Безналичный": (8, 23),
+    "Наличный": (26, 40),
+}
+RU_MONTHS = {
+    1: "январь", 2: "февраль", 3: "март", 4: "апрель", 5: "май", 6: "июнь",
+    7: "июль", 8: "август", 9: "сентябрь", 10: "октябрь", 11: "ноябрь", 12: "декабрь",
+}
+# ------------------------------------------------------------------
+
 # Состояния диалогов ручного ввода
 (P_DATE, P_FIO, P_TIRES, P_BAGS, P_THREAD, P_F01, P_F12, P_F24, P_F46, P_F68, P_CORD, P_NOTE) = range(12)
-(S_DATE, S_BUYER, S_PAYTYPE, S_FRAC, S_KG, S_SUM_VAT, S_VAT, S_NOTE) = range(12, 20)
+# CHANGED: добавлено состояние S_PRICE (цена за кг)
+(S_DATE, S_BUYER, S_PAYTYPE, S_FRAC, S_KG, S_PRICE, S_SUM_VAT, S_VAT, S_NOTE) = range(12, 21)
 
 FRACTIONS = ["0-1", "1-2", "2-4", "4-6", "6-8"]
 
@@ -37,11 +62,13 @@ FRACTIONS = ["0-1", "1-2", "2-4", "4-6", "6-8"]
 PROD_HEADERS = ["Дата", "ФИО оператора", "Вес шин кг", "Мешки шт", "Нитки",
                 "Фракция 0-1", "Фракция 1-2", "Фракция 2-4", "Фракция 4-6", "Фракция 6-8",
                 "Всего крошки кг", "Металлокорд кг", "Примечание"]
+# CHANGED: добавлена "Цена за кг" между "Количество кг" и "Сумма с НДС"
 SALES_HEADERS = ["Дата", "Покупатель", "Тип расчёта", "Фракция", "Количество кг",
-                 "Сумма с НДС", "Сумма НДС", "Примечание"]
+                 "Цена за кг", "Сумма с НДС", "Сумма НДС", "Примечание"]
 
 _gc = None
 _spreadsheet = None
+_report_spreadsheet = None  # NEW
 
 
 def parse_num(text):
@@ -61,17 +88,37 @@ def parse_num(text):
 
 # ---------- Google Sheets: подключение и доступ к листам ----------
 
+def _get_client():
+    """Авторизация служебного аккаунта (один раз)."""
+    global _gc
+    if _gc is None:
+        if not GOOGLE_CREDENTIALS:
+            raise RuntimeError("Не задан GOOGLE_CREDENTIALS в переменных окружения.")
+        creds_dict = json.loads(GOOGLE_CREDENTIALS)
+        _gc = gspread.service_account_from_dict(creds_dict)
+    return _gc
+
+
 def get_spreadsheet():
-    """Ленивое подключение к таблице. Кэшируем, чтобы не авторизоваться каждый раз."""
-    global _gc, _spreadsheet
+    """Ленивое подключение к таблице-складу. Кэшируем, чтобы не авторизоваться каждый раз."""
+    global _spreadsheet
     if _spreadsheet is not None:
         return _spreadsheet
-    if not GOOGLE_CREDENTIALS or not SPREADSHEET_ID:
-        raise RuntimeError("Не заданы GOOGLE_CREDENTIALS или SPREADSHEET_ID в переменных окружения.")
-    creds_dict = json.loads(GOOGLE_CREDENTIALS)
-    _gc = gspread.service_account_from_dict(creds_dict)
-    _spreadsheet = _gc.open_by_key(SPREADSHEET_ID)
+    if not SPREADSHEET_ID:
+        raise RuntimeError("Не задан SPREADSHEET_ID в переменных окружения.")
+    _spreadsheet = _get_client().open_by_key(SPREADSHEET_ID)
     return _spreadsheet
+
+
+def get_report_spreadsheet():
+    """NEW: ленивое подключение к файлу отчёта 'Реализация 2026г'."""
+    global _report_spreadsheet
+    if _report_spreadsheet is not None:
+        return _report_spreadsheet
+    if not REPORT_SPREADSHEET_ID:
+        raise RuntimeError("Не задан REPORT_SPREADSHEET_ID в переменных окружения.")
+    _report_spreadsheet = _get_client().open_by_key(REPORT_SPREADSHEET_ID)
+    return _report_spreadsheet
 
 
 def get_worksheet(title, headers):
@@ -144,12 +191,101 @@ def save_sale(data):
         data.get("тип_расчета", ""),
         data.get("фракция", ""),
         qty_kg,
+        parse_num(data.get("цена_за_кг", 0)),  # CHANGED: новая колонка "Цена за кг"
         parse_num(data.get("сумма_с_ндс", 0)),
         parse_num(data.get("сумма_ндс", 0)),
         data.get("примечание", ""),
     ]
     ws.append_row(row, value_input_option="USER_ENTERED")
 
+
+# ---------- NEW: запись реализации в отчёт "Реализация 2026г" ----------
+
+def _normalize_fraction(frac_text):
+    """Из произвольного текста фракции выделяет канон '0-1'/'1-2'/.../'6-8'."""
+    for f in FRACTIONS:
+        if f in str(frac_text):
+            return f
+    return None
+
+
+def _parse_sale_date(date_text):
+    """Пытается распарсить дату 'дд.мм.гггг'. Возвращает datetime или None."""
+    s = str(date_text).strip()
+    for fmt in ("%d.%m.%Y", "%d.%m.%y"):
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            continue
+    return None
+
+
+def _get_or_create_month_sheet(sh, dt):
+    """Находит вкладку месяца ('июнь 2026'); если нет — копирует ШАБЛОН и переименовывает."""
+    title = f"{RU_MONTHS[dt.month]} {dt.year}"
+    try:
+        return sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        pass
+    # Листа нет — создаём из шаблона
+    template = sh.worksheet(REPORT_TEMPLATE)  # бросит WorksheetNotFound, если шаблона нет
+    new_ws = template.duplicate(new_sheet_name=title)
+    return new_ws
+
+
+def write_sale_to_report(data):
+    """Дописывает строку реализации в отчёт. Возвращает (ok: bool, msg: str).
+    Не бросает наружу — ошибки ловит вызывающий код по флагу."""
+    pay = str(data.get("тип_расчета", "")).strip()
+    if pay not in REPORT_BLOCKS:
+        return False, f"тип расчёта не распознан ('{pay}') — строка в отчёт не добавлена"
+
+    frac = _normalize_fraction(data.get("фракция", ""))
+    if frac is None:
+        return False, "фракция не распознана — строка в отчёт не добавлена"
+
+    dt = _parse_sale_date(data.get("дата", ""))
+    if dt is None:
+        return False, "дата не распознана — строка в отчёт не добавлена"
+
+    sh = get_report_spreadsheet()
+    ws = _get_or_create_month_sheet(sh, dt)
+
+    start_row, end_row = REPORT_BLOCKS[pay]
+    # Ищем первую свободную строку блока (пустой столбец B = Дата)
+    date_col_vals = ws.col_values(REPORT_DATE_COL)  # значения столбца B сверху вниз
+    target_row = None
+    for r in range(start_row, end_row + 1):
+        val = date_col_vals[r - 1] if r - 1 < len(date_col_vals) else ""
+        if not str(val).strip():
+            target_row = r
+            break
+    if target_row is None:
+        return False, f"блок «{pay}» заполнен (нет свободных строк) — строка не добавлена"
+
+    qty_kg = parse_num(data.get("количество_кг", 0))
+    if not qty_kg and data.get("количество_т"):
+        qty_kg = parse_num(data.get("количество_т", 0)) * 1000
+    price = parse_num(data.get("цена_за_кг", 0))
+    total_sum = parse_num(data.get("сумма_с_ндс", 0))
+
+    qcol, pcol, scol = REPORT_FRAC_COLS[frac]
+
+    # Готовим точечные обновления ячеек
+    updates = [
+        {"range": gspread.utils.rowcol_to_a1(target_row, REPORT_DATE_COL),
+         "values": [[dt.strftime("%d.%m.%Y")]]},
+        {"range": gspread.utils.rowcol_to_a1(target_row, REPORT_BUYER_COL),
+         "values": [[data.get("покупатель", "")]]},
+        {"range": gspread.utils.rowcol_to_a1(target_row, qcol), "values": [[qty_kg]]},
+        {"range": gspread.utils.rowcol_to_a1(target_row, pcol), "values": [[price]]},
+        {"range": gspread.utils.rowcol_to_a1(target_row, scol), "values": [[total_sum]]},
+    ]
+    ws.batch_update(updates, value_input_option="USER_ENTERED")
+    return True, f"добавлено в «{ws.title}», блок «{pay}», строка {target_row}"
+
+
+# ---------- Остаток ----------
 
 def calc_stock():
     income = {k: 0 for k in FRACTIONS}
@@ -225,12 +361,14 @@ async def recognize_production(image_bytes: bytes):
 
 async def recognize_sale(image_bytes: bytes):
     image_b64 = base64.b64encode(image_bytes).decode()
+    # CHANGED: добавлено поле цена_за_кг
     prompt = """Это фото накладной на отпуск/реализацию резиновой крошки.
 Распознай данные и верни ТОЛЬКО JSON без markdown:
-{"дата":"дд.мм.гггг","покупатель":"название организации или ИП","фракция":"например 2-4","количество_т":0.0,"количество_кг":0,"сумма_с_ндс":0,"сумма_ндс":0,"примечание":""}
+{"дата":"дд.мм.гггг","покупатель":"название организации или ИП","фракция":"например 2-4","количество_т":0.0,"количество_кг":0,"цена_за_кг":0,"сумма_с_ндс":0,"сумма_ндс":0,"примечание":""}
 Количество бери из колонки "отпущено". Если оно в тоннах — заполни количество_т, если в кг — количество_кг.
+Цену бери из колонки "цена" (цена за 1 кг). Бери ровно как в накладной, не пересчитывай.
 Сумму с НДС бери из колонки "Сумма с НДС" (полная сумма включая НДС).
-Сумму НДС бери из колонки "Сумма НДС" (только НДС).
+Сумму НДС бери из колонки "Сумма НДС" (только НДС). Если НДС в накладной нет — поставь 0.
 Если не читается — 0."""
     return await call_claude(image_b64, prompt)
 
@@ -470,6 +608,14 @@ async def manual_sale_frac(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def manual_sale_kg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["sale"]["количество_кг"] = parse_num(update.message.text)
+    # CHANGED: теперь спрашиваем цену за кг
+    await update.message.reply_text("💵 Цена за кг, тнг? (как в накладной)")
+    return S_PRICE
+
+
+async def manual_sale_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # NEW: шаг "цена за кг"
+    context.user_data["sale"]["цена_за_кг"] = parse_num(update.message.text)
     await update.message.reply_text("💰 Сумма с НДС, тнг?")
     return S_SUM_VAT
 
@@ -491,6 +637,16 @@ async def manual_sale_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["sale"]["примечание"] = "" if note in ("-", "—") else note
     d = context.user_data["sale"]
     save_sale(d)
+
+    # NEW: дописываем в отчёт; ошибка отчёта не валит сохранение в склад
+    report_line = ""
+    try:
+        ok, msg = write_sale_to_report(d)
+        report_line = ("\n\n🧾 Отчёт: " + msg) if ok else ("\n\n⚠️ Отчёт: " + msg)
+    except Exception as e:
+        logger.error(f"Report write error: {e}")
+        report_line = "\n\n⚠️ Отчёт: не удалось записать (склад сохранён)."
+
     qty_kg = parse_num(d.get("количество_кг", 0))
     reply = (
         f"✅ *Реализация сохранена!*\n\n"
@@ -499,8 +655,9 @@ async def manual_sale_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💳 Тип расчёта: {d.get('тип_расчета', '—')}\n"
         f"📦 Фракция: {d.get('фракция', '—')}\n"
         f"⚖️ Количество: {qty_kg} кг\n"
+        f"💵 Цена за кг: {d.get('цена_за_кг', 0)} тнг\n"
         f"💰 Сумма с НДС: {d.get('сумма_с_ндс', 0)} тнг\n"
-        f"💰 Сумма НДС: {d.get('сумма_ндс', 0)} тнг"
+        f"💰 Сумма НДС: {d.get('сумма_ндс', 0)} тнг" + report_line
     )
     await update.message.reply_text(reply, parse_mode="Markdown")
     context.user_data.pop("sale", None)
@@ -543,6 +700,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Тип расчёта с фото не всегда виден — по умолчанию пусто, уточнит вручную при необходимости
             data.setdefault("тип_расчета", "")
             save_sale(data)
+
+            # NEW: пробуем дописать в отчёт (только если тип расчёта распознан)
+            report_line = ""
+            try:
+                ok, msg = write_sale_to_report(data)
+                report_line = ("\n🧾 Отчёт: " + msg) if ok else ("\n⚠️ Отчёт: " + msg)
+            except Exception as e:
+                logger.error(f"Report write error: {e}")
+                report_line = "\n⚠️ Отчёт: не удалось записать (склад сохранён)."
+
             qty_kg = parse_num(data.get("количество_кг", 0))
             if not qty_kg and data.get("количество_т"):
                 qty_kg = parse_num(data.get("количество_т", 0)) * 1000
@@ -553,8 +720,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"💳 Тип расчёта: {data.get('тип_расчета') or '— (уточни вручную)'}\n"
                 f"📦 Фракция: {data.get('фракция', '—')}\n"
                 f"⚖️ Количество: {qty_kg:.0f} кг\n"
+                f"💵 Цена за кг: {data.get('цена_за_кг', 0)} тнг\n"
                 f"💰 Сумма с НДС: {data.get('сумма_с_ндс', 0)} тнг\n"
-                f"💰 Сумма НДС: {data.get('сумма_ндс', 0)} тнг"
+                f"💰 Сумма НДС: {data.get('сумма_ндс', 0)} тнг" + report_line
             )
             await update.message.reply_text(reply, parse_mode="Markdown")
             context.user_data["photo_type"] = "production"
@@ -633,6 +801,7 @@ def main():
             S_PAYTYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_paytype)],
             S_FRAC: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_frac)],
             S_KG: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_kg)],
+            S_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_price)],  # NEW
             S_SUM_VAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_sum_vat)],
             S_VAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_vat)],
             S_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_note)],
