@@ -10,9 +10,7 @@ from telegram.ext import (
     ContextTypes, ConversationHandler
 )
 import httpx
-from openpyxl import load_workbook, Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
+import gspread
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -22,19 +20,28 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 PORT = int(os.environ.get("PORT", 8080))
 
-PRODUCTION_FILE = "uchet_kroshki.xlsx"
-SALES_FILE = "uchet_realizacii.xlsx"
+# --- Google Sheets ---
+SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
+GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")  # содержимое JSON-ключа целиком
+
+SHEET_PRODUCTION = "Производство"
+SHEET_SALES = "Реализация"
 
 # Состояния диалогов ручного ввода
-(P_DATE, P_FIO, P_TIRES, P_F01, P_F12, P_F24, P_F46, P_F68, P_CORD, P_NOTE) = range(10)
-(S_DATE, S_BUYER, S_FRAC, S_KG, S_SUM_VAT, S_VAT, S_NOTE) = range(10, 17)
+(P_DATE, P_FIO, P_TIRES, P_BAGS, P_THREAD, P_F01, P_F12, P_F24, P_F46, P_F68, P_CORD, P_NOTE) = range(12)
+(S_DATE, S_BUYER, S_PAYTYPE, S_FRAC, S_KG, S_SUM_VAT, S_VAT, S_NOTE) = range(12, 20)
 
 FRACTIONS = ["0-1", "1-2", "2-4", "4-6", "6-8"]
 
+# Заголовки листов склада (порядок колонок = порядок записи)
+PROD_HEADERS = ["Дата", "ФИО оператора", "Вес шин кг", "Мешки шт", "Нитки",
+                "Фракция 0-1", "Фракция 1-2", "Фракция 2-4", "Фракция 4-6", "Фракция 6-8",
+                "Всего крошки кг", "Металлокорд кг", "Примечание"]
+SALES_HEADERS = ["Дата", "Покупатель", "Тип расчёта", "Фракция", "Количество кг",
+                 "Сумма с НДС", "Сумма НДС", "Примечание"]
 
-def make_border():
-    thin = Side(style='thin', color='AAAAAA')
-    return Border(left=thin, right=thin, top=thin, bottom=thin)
+_gc = None
+_spreadsheet = None
 
 
 def parse_num(text):
@@ -52,145 +59,122 @@ def parse_num(text):
         return 0
 
 
-def get_or_create_production():
-    if os.path.exists(PRODUCTION_FILE):
-        return load_workbook(PRODUCTION_FILE)
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Журнал"
-    border = make_border()
-    headers = ["Дата", "ФИО оператора", "Вес шин, кг", "Фракция 0-1", "Фракция 1-2",
-               "Фракция 2-4", "Фракция 4-6", "Фракция 6-8", "Всего крошки, кг", "Металл. корд, кг", "Примечание"]
-    for col, h in enumerate(headers, 1):
-        c = ws.cell(row=1, column=col)
-        c.value = h
-        c.font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-        c.fill = PatternFill("solid", fgColor="1F5C8B")
-        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        c.border = border
-    ws.row_dimensions[1].height = 36
-    for i, w in enumerate([12, 20, 12, 11, 11, 11, 11, 11, 14, 13, 18], 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-    wb.save(PRODUCTION_FILE)
-    return wb
+# ---------- Google Sheets: подключение и доступ к листам ----------
+
+def get_spreadsheet():
+    """Ленивое подключение к таблице. Кэшируем, чтобы не авторизоваться каждый раз."""
+    global _gc, _spreadsheet
+    if _spreadsheet is not None:
+        return _spreadsheet
+    if not GOOGLE_CREDENTIALS or not SPREADSHEET_ID:
+        raise RuntimeError("Не заданы GOOGLE_CREDENTIALS или SPREADSHEET_ID в переменных окружения.")
+    creds_dict = json.loads(GOOGLE_CREDENTIALS)
+    _gc = gspread.service_account_from_dict(creds_dict)
+    _spreadsheet = _gc.open_by_key(SPREADSHEET_ID)
+    return _spreadsheet
 
 
-def get_or_create_sales():
-    if os.path.exists(SALES_FILE):
-        return load_workbook(SALES_FILE)
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Реализация"
-    border = make_border()
-    headers = ["Дата", "Покупатель", "Фракция", "Количество, т", "Количество, кг",
-               "Сумма с НДС, тнг", "Сумма НДС, тнг", "Примечание"]
-    for col, h in enumerate(headers, 1):
-        c = ws.cell(row=1, column=col)
-        c.value = h
-        c.font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-        c.fill = PatternFill("solid", fgColor="1E7145")
-        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        c.border = border
-    ws.row_dimensions[1].height = 36
-    for i, w in enumerate([12, 25, 15, 14, 14, 18, 16, 20], 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-    wb.save(SALES_FILE)
-    return wb
+def get_worksheet(title, headers):
+    """Возвращает лист по имени. Если листа нет — создаёт и пишет шапку.
+    Если лист пустой — пишет шапку."""
+    sh = get_spreadsheet()
+    try:
+        ws = sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=title, rows=1000, cols=max(len(headers), 12))
+        ws.append_row(headers, value_input_option="USER_ENTERED")
+        return ws
+    # Лист есть — проверим, есть ли шапка
+    first = ws.row_values(1)
+    if not first:
+        ws.append_row(headers, value_input_option="USER_ENTERED")
+    return ws
 
+
+def get_production_ws():
+    return get_worksheet(SHEET_PRODUCTION, PROD_HEADERS)
+
+
+def get_sales_ws():
+    return get_worksheet(SHEET_SALES, SALES_HEADERS)
+
+
+# ---------- Чтение/запись данных ----------
 
 def get_existing_dates_production():
-    wb = get_or_create_production()
-    ws = wb.active
+    ws = get_production_ws()
     dates = set()
-    for row in range(2, ws.max_row + 1):
-        val = ws.cell(row=row, column=1).value
+    col = ws.col_values(1)  # колонка "Дата"
+    for val in col[1:]:  # пропускаем шапку
         if val:
             dates.add(str(val).strip())
     return dates
 
 
 def save_production(data):
-    wb = get_or_create_production()
-    ws = wb.active
-    border = make_border()
-    next_row = ws.max_row + 1
-    shade = "F2F2F2" if next_row % 2 == 0 else "FFFFFF"
-    values = [
+    ws = get_production_ws()
+    f01 = parse_num(data.get("фракция_0_1", 0))
+    f12 = parse_num(data.get("фракция_1_2", 0))
+    f24 = parse_num(data.get("фракция_2_4", 0))
+    f46 = parse_num(data.get("фракция_4_6", 0))
+    f68 = parse_num(data.get("фракция_6_8", 0))
+    total = f01 + f12 + f24 + f46 + f68
+    row = [
         data.get("дата", datetime.now().strftime("%d.%m.%Y")),
         data.get("фио", ""),
-        data.get("вес_шин", ""),
-        data.get("фракция_0_1", ""),
-        data.get("фракция_1_2", ""),
-        data.get("фракция_2_4", ""),
-        data.get("фракция_4_6", ""),
-        data.get("фракция_6_8", ""),
-        f"=SUM(D{next_row}:H{next_row})",
-        data.get("металл_корд", ""),
+        parse_num(data.get("вес_шин", 0)),
+        parse_num(data.get("мешки", 0)),
+        parse_num(data.get("нитки", 0)),
+        f01, f12, f24, f46, f68,
+        total,
+        parse_num(data.get("металл_корд", 0)),
         data.get("примечание", ""),
     ]
-    for col, val in enumerate(values, 1):
-        c = ws.cell(row=next_row, column=col)
-        c.value = val
-        c.font = Font(name="Arial", size=10)
-        c.fill = PatternFill("solid", fgColor=shade)
-        c.alignment = Alignment(horizontal="center", vertical="center")
-        c.border = border
-    wb.save(PRODUCTION_FILE)
+    ws.append_row(row, value_input_option="USER_ENTERED")
 
 
 def save_sale(data):
-    wb = get_or_create_sales()
-    ws = wb.active
-    border = make_border()
-    next_row = ws.max_row + 1
-    shade = "F2F2F2" if next_row % 2 == 0 else "FFFFFF"
-    # Источник правды — кг. Тонны считаем из кг для отображения.
+    ws = get_sales_ws()
     qty_kg = parse_num(data.get("количество_кг", 0))
     if not qty_kg and data.get("количество_т"):
         qty_kg = parse_num(data.get("количество_т", 0)) * 1000
-    qty_t = round(qty_kg / 1000, 3) if qty_kg else 0
-    values = [
+    row = [
         data.get("дата", datetime.now().strftime("%d.%m.%Y")),
         data.get("покупатель", ""),
+        data.get("тип_расчета", ""),
         data.get("фракция", ""),
-        qty_t,
         qty_kg,
         parse_num(data.get("сумма_с_ндс", 0)),
         parse_num(data.get("сумма_ндс", 0)),
         data.get("примечание", ""),
     ]
-    for col, val in enumerate(values, 1):
-        c = ws.cell(row=next_row, column=col)
-        c.value = val
-        c.font = Font(name="Arial", size=10)
-        c.fill = PatternFill("solid", fgColor=shade)
-        c.alignment = Alignment(horizontal="center", vertical="center")
-        c.border = border
-    wb.save(SALES_FILE)
+    ws.append_row(row, value_input_option="USER_ENTERED")
 
 
 def calc_stock():
     income = {k: 0 for k in FRACTIONS}
-    wb_p = get_or_create_production()
-    ws_p = wb_p.active
-    for row in range(2, ws_p.max_row + 1):
-        for i, key in enumerate(FRACTIONS, 4):
-            val = ws_p.cell(row=row, column=i).value
-            try:
-                income[key] += float(val) if val else 0
-            except Exception:
-                pass
+    ws_p = get_production_ws()
+    rows = ws_p.get_all_values()
+    # колонки фракций: индексы 5..9 (0-based) при PROD_HEADERS
+    for r in rows[1:]:
+        for i, key in enumerate(FRACTIONS, 5):
+            if i < len(r):
+                try:
+                    income[key] += float(str(r[i]).replace(",", ".")) if r[i] else 0
+                except Exception:
+                    pass
 
     outcome = {k: 0 for k in FRACTIONS}
-    wb_s = get_or_create_sales()
-    ws_s = wb_s.active
-    for row in range(2, ws_s.max_row + 1):
-        frac = ws_s.cell(row=row, column=3).value or ""
-        qty_kg = ws_s.cell(row=row, column=5).value or 0
+    ws_s = get_sales_ws()
+    rows_s = ws_s.get_all_values()
+    # Реализация: Фракция = индекс 3, Количество кг = индекс 4
+    for r in rows_s[1:]:
+        frac = r[3] if len(r) > 3 else ""
+        qty = r[4] if len(r) > 4 else 0
         for key in outcome:
             if key in str(frac):
                 try:
-                    outcome[key] += float(qty_kg)
+                    outcome[key] += float(str(qty).replace(",", ".")) if qty else 0
                 except Exception:
                     pass
                 break
@@ -198,6 +182,8 @@ def calc_stock():
     stock = {k: income[k] - outcome[k] for k in income}
     return income, outcome, stock
 
+
+# ---------- Распознавание фото через Claude ----------
 
 async def call_claude(image_b64: str, prompt: str):
     async with httpx.AsyncClient(timeout=60) as client:
@@ -232,7 +218,7 @@ async def recognize_production(image_bytes: bytes):
     prompt = """Это фото ежедневного отчёта по производству резиновой крошки.
 На фото может быть одна или несколько строк. Верни ТОЛЬКО JSON без markdown.
 Если одна строка — объект, если несколько — массив объектов. Формат:
-{"дата":"дд.мм.гггг","фио":"ФИО","вес_шин":0,"фракция_0_1":0,"фракция_1_2":0,"фракция_2_4":0,"фракция_4_6":0,"фракция_6_8":0,"металл_корд":0,"примечание":""}
+{"дата":"дд.мм.гггг","фио":"ФИО","вес_шин":0,"мешки":0,"нитки":0,"фракция_0_1":0,"фракция_1_2":0,"фракция_2_4":0,"фракция_4_6":0,"фракция_6_8":0,"металл_корд":0,"примечание":""}
 Если не читается — 0."""
     return await call_claude(image_b64, prompt)
 
@@ -265,7 +251,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✍️ Ввод реализации — внести вручную по шагам\n\n"
         "Команды:\n"
         "/ostatok — остаток на складе\n"
-        "/get — скачать таблицы Excel\n"
         "/last — последние записи\n"
         "/cancel — отменить ручной ввод",
         reply_markup=reply_markup
@@ -291,35 +276,19 @@ async def ostatok(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
-async def get_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    date_str = datetime.now().strftime('%d%m%Y')
-    get_or_create_production()
-    get_or_create_sales()
-    for filepath, caption in [
-        (PRODUCTION_FILE, "📊 Журнал производства"),
-        (SALES_FILE, "📄 Журнал реализации")
-    ]:
-        with open(filepath, "rb") as f:
-            await update.message.reply_document(
-                document=f,
-                filename=f"{filepath.replace('.xlsx', '')}_{date_str}.xlsx",
-                caption=caption
-            )
-
-
 async def last_records(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    wb = get_or_create_production()
-    ws = wb.active
-    max_row = ws.max_row
-    if max_row <= 1:
+    ws = get_production_ws()
+    rows = ws.get_all_values()
+    data_rows = rows[1:]  # без шапки
+    if not data_rows:
         await update.message.reply_text("📭 Записей пока нет.")
         return
-    start_row = max(2, max_row - 4)
+    last5 = data_rows[-5:]
     text = "📋 *Последние записи производства:*\n\n"
-    for row in range(start_row, max_row + 1):
-        date = ws.cell(row=row, column=1).value or "—"
-        fio = ws.cell(row=row, column=2).value or "—"
-        total = ws.cell(row=row, column=9).value or "—"
+    for r in last5:
+        date = r[0] if len(r) > 0 and r[0] else "—"
+        fio = r[1] if len(r) > 1 and r[1] else "—"
+        total = r[10] if len(r) > 10 and r[10] else "—"
         text += f"📅 {date} | {fio} | {total} кг\n"
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -355,6 +324,18 @@ async def manual_prod_fio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def manual_prod_tires(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["prod"]["вес_шин"] = parse_num(update.message.text)
+    await update.message.reply_text("🛍 Мешки, шт?")
+    return P_BAGS
+
+
+async def manual_prod_bags(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["prod"]["мешки"] = parse_num(update.message.text)
+    await update.message.reply_text("🧵 Нитки, кг? (или «-» если нет)")
+    return P_THREAD
+
+
+async def manual_prod_thread(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["prod"]["нитки"] = parse_num(update.message.text)
     await update.message.reply_text("Фракция 0-1, кг?")
     return P_F01
 
@@ -406,13 +387,15 @@ async def manual_prod_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dup_note = "\n\n⚠️ Запись с этой датой уже есть — добавлю ещё одну строку."
 
     save_production(d)
-    total = (d.get("фракция_0_1", 0) + d.get("фракция_1_2", 0) + d.get("фракция_2_4", 0)
-             + d.get("фракция_4_6", 0) + d.get("фракция_6_8", 0))
+    total = (parse_num(d.get("фракция_0_1", 0)) + parse_num(d.get("фракция_1_2", 0))
+             + parse_num(d.get("фракция_2_4", 0)) + parse_num(d.get("фракция_4_6", 0))
+             + parse_num(d.get("фракция_6_8", 0)))
     reply = (
         f"✅ *Производство сохранено!*\n\n"
         f"📅 Дата: {d.get('дата', '—')}\n"
         f"👤 Оператор: {d.get('фио', '—')}\n"
-        f"⚖️ Вес шин: {d.get('вес_шин', 0)} кг\n\n"
+        f"⚖️ Вес шин: {d.get('вес_шин', 0)} кг\n"
+        f"🛍 Мешки: {d.get('мешки', 0)} шт\n\n"
         f"*Фракции (кг):*\n"
         f"  0-1: {d.get('фракция_0_1', 0)}\n"
         f"  1-2: {d.get('фракция_1_2', 0)}\n"
@@ -451,6 +434,21 @@ async def manual_sale_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def manual_sale_buyer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["sale"]["покупатель"] = update.message.text.strip()
+    kb = ReplyKeyboardMarkup([["Безналичный", "Наличный"]], resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text("💳 Тип расчёта? (Безналичный / Наличный)", reply_markup=kb)
+    return S_PAYTYPE
+
+
+async def manual_sale_paytype(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    val = update.message.text.strip().lower()
+    if "нал" in val and "без" not in val:
+        pay = "Наличный"
+    elif "без" in val:
+        pay = "Безналичный"
+    else:
+        await update.message.reply_text("⚠️ Выбери: Безналичный или Наличный")
+        return S_PAYTYPE
+    context.user_data["sale"]["тип_расчета"] = pay
     await update.message.reply_text(
         "📦 Фракция? (например: 2-4)\n_Доступны: 0-1, 1-2, 2-4, 4-6, 6-8_",
         parse_mode="Markdown"
@@ -498,6 +496,7 @@ async def manual_sale_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ *Реализация сохранена!*\n\n"
         f"📅 Дата: {d.get('дата', '—')}\n"
         f"🏢 Покупатель: {d.get('покупатель', '—')}\n"
+        f"💳 Тип расчёта: {d.get('тип_расчета', '—')}\n"
         f"📦 Фракция: {d.get('фракция', '—')}\n"
         f"⚖️ Количество: {qty_kg} кг\n"
         f"💰 Сумма с НДС: {d.get('сумма_с_ндс', 0)} тнг\n"
@@ -526,7 +525,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["photo_type"] = "sale"
         await update.message.reply_text("📄 Отправь фото накладной на реализацию.")
     else:
-        await update.message.reply_text("Используй кнопки меню или команды /ostatok, /get, /last")
+        await update.message.reply_text("Используй кнопки меню или команды /ostatok, /last")
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -541,6 +540,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if photo_type == "sale":
             data = await recognize_sale(image_bytes)
             logger.info(f"Sale data: {data}")
+            # Тип расчёта с фото не всегда виден — по умолчанию пусто, уточнит вручную при необходимости
+            data.setdefault("тип_расчета", "")
             save_sale(data)
             qty_kg = parse_num(data.get("количество_кг", 0))
             if not qty_kg and data.get("количество_т"):
@@ -549,6 +550,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅ *Реализация сохранена!*\n\n"
                 f"📅 Дата: {data.get('дата', '—')}\n"
                 f"🏢 Покупатель: {data.get('покупатель', '—')}\n"
+                f"💳 Тип расчёта: {data.get('тип_расчета') or '— (уточни вручную)'}\n"
                 f"📦 Фракция: {data.get('фракция', '—')}\n"
                 f"⚖️ Количество: {qty_kg:.0f} кг\n"
                 f"💰 Сумма с НДС: {data.get('сумма_с_ндс', 0)} тнг\n"
@@ -604,13 +606,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Диалог ручного ввода производства
     prod_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^✍️ Ввод производства$"), manual_prod_start)],
         states={
             P_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_prod_date)],
             P_FIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_prod_fio)],
             P_TIRES: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_prod_tires)],
+            P_BAGS: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_prod_bags)],
+            P_THREAD: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_prod_thread)],
             P_F01: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_prod_f01)],
             P_F12: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_prod_f12)],
             P_F24: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_prod_f24)],
@@ -622,12 +625,12 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    # Диалог ручного ввода реализации
     sale_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^✍️ Ввод реализации$"), manual_sale_start)],
         states={
             S_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_date)],
             S_BUYER: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_buyer)],
+            S_PAYTYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_paytype)],
             S_FRAC: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_frac)],
             S_KG: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_kg)],
             S_SUM_VAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_sum_vat)],
@@ -639,7 +642,6 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ostatok", ostatok))
-    app.add_handler(CommandHandler("get", get_files))
     app.add_handler(CommandHandler("last", last_records))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(prod_conv)
