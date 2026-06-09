@@ -22,18 +22,18 @@ PORT = int(os.environ.get("PORT", 8080))
 
 # --- Google Sheets ---
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
-REPORT_SPREADSHEET_ID = os.environ.get("REPORT_SPREADSHEET_ID", "")  # NEW: файл "Реализация 2026г"
+REPORT_SPREADSHEET_ID = os.environ.get("REPORT_SPREADSHEET_ID", "")  # файл "Реализация 2026г"
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")  # содержимое JSON-ключа целиком
 
 SHEET_PRODUCTION = "Производство"
 SHEET_SALES = "Реализация"
 
-# NEW: список разрешённых Telegram ID (закрытый доступ).
+# Список разрешённых Telegram ID (закрытый доступ).
 # Пустой список = пускать всех (страховка, чтобы не заблокировать себя).
 _allowed_raw = os.environ.get("ALLOWED_USERS", "")
 ALLOWED_USERS = {int(x) for x in _allowed_raw.replace(" ", "").split(",") if x.strip().isdigit()}
 
-# NEW: настройки отчёта реализации ---------------------------------
+# --- настройки отчёта реализации ---------------------------------
 REPORT_TEMPLATE = "ШАБЛОН"                 # лист-образец (пустой бланк)
 REPORT_DATE_COL = 2                        # B = Дата
 REPORT_BUYER_COL = 3                       # C = Контрагент
@@ -58,8 +58,9 @@ RU_MONTHS = {
 
 # Состояния диалогов ручного ввода
 (P_DATE, P_FIO, P_TIRES, P_BAGS, P_THREAD, P_F01, P_F12, P_F24, P_F46, P_F68, P_CORD, P_NOTE) = range(12)
-# CHANGED: добавлено состояние S_PRICE (цена за кг)
 (S_DATE, S_BUYER, S_PAYTYPE, S_FRAC, S_KG, S_PRICE, S_SUM_VAT, S_VAT, S_NOTE) = range(12, 21)
+# NEW: состояние подтверждения дубля при фото-производстве
+(PHOTO_PROD_CONFIRM,) = range(21, 22)
 
 FRACTIONS = ["0-1", "1-2", "2-4", "4-6", "6-8"]
 
@@ -67,13 +68,12 @@ FRACTIONS = ["0-1", "1-2", "2-4", "4-6", "6-8"]
 PROD_HEADERS = ["Дата", "ФИО оператора", "Вес шин кг", "Мешки шт", "Нитки",
                 "Фракция 0-1", "Фракция 1-2", "Фракция 2-4", "Фракция 4-6", "Фракция 6-8",
                 "Всего крошки кг", "Металлокорд кг", "Примечание"]
-# CHANGED: добавлена "Цена за кг" между "Количество кг" и "Сумма с НДС"
 SALES_HEADERS = ["Дата", "Покупатель", "Тип расчёта", "Фракция", "Количество кг",
                  "Цена за кг", "Сумма с НДС", "Сумма НДС", "Примечание"]
 
 _gc = None
 _spreadsheet = None
-_report_spreadsheet = None  # NEW
+_report_spreadsheet = None
 
 
 def parse_num(text):
@@ -91,7 +91,42 @@ def parse_num(text):
         return 0
 
 
-# ---------- NEW: контроль доступа ----------
+def parse_date_or_none(date_text):
+    """Главная проверка даты. Принимает строку, которую отдал Claude или ввёл человек.
+    Понимает обычные форматы С РАЗДЕЛИТЕЛЯМИ: '08.06.2026', '8.6.26', '8/6/2026', '8-6-26'.
+    Год из двух цифр -> 20xx. Возвращает datetime, либо None если разобрать нельзя.
+    НИКАКОГО угадывания слитных цифр — если непонятно, вернём None и спросим человека."""
+    if date_text is None:
+        return None
+    s = str(date_text).strip()
+    if not s:
+        return None
+    # сперва пробуем строгие форматы целиком
+    for fmt in ("%d.%m.%Y", "%d.%m.%y", "%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y", "%d-%m-%y"):
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            continue
+    # затем — разделители любого вида: ровно 3 числовые части день/месяц/год
+    parts = [p for p in re.split(r"[.\-/\s]+", s) if p != ""]
+    if len(parts) == 3 and all(p.isdigit() for p in parts):
+        d, m, y = parts
+        try:
+            d_i, m_i, y_i = int(d), int(m), int(y)
+            if y_i < 100:
+                y_i += 2000
+            return datetime(y_i, m_i, d_i)
+        except Exception:
+            return None
+    return None
+
+
+def date_to_str(dt):
+    """datetime -> 'дд.мм.гггг'."""
+    return dt.strftime("%d.%m.%Y")
+
+
+# ---------- контроль доступа ----------
 
 def is_allowed(update: Update) -> bool:
     """True, если пользователь в списке разрешённых.
@@ -105,7 +140,6 @@ def is_allowed(update: Update) -> bool:
 # ---------- Google Sheets: подключение и доступ к листам ----------
 
 def _get_client():
-    """Авторизация служебного аккаунта (один раз)."""
     global _gc
     if _gc is None:
         if not GOOGLE_CREDENTIALS:
@@ -116,7 +150,6 @@ def _get_client():
 
 
 def get_spreadsheet():
-    """Ленивое подключение к таблице-складу. Кэшируем, чтобы не авторизоваться каждый раз."""
     global _spreadsheet
     if _spreadsheet is not None:
         return _spreadsheet
@@ -127,7 +160,6 @@ def get_spreadsheet():
 
 
 def get_report_spreadsheet():
-    """NEW: ленивое подключение к файлу отчёта 'Реализация 2026г'."""
     global _report_spreadsheet
     if _report_spreadsheet is not None:
         return _report_spreadsheet
@@ -138,8 +170,6 @@ def get_report_spreadsheet():
 
 
 def get_worksheet(title, headers):
-    """Возвращает лист по имени. Если листа нет — создаёт и пишет шапку.
-    Если лист пустой — пишет шапку."""
     sh = get_spreadsheet()
     try:
         ws = sh.worksheet(title)
@@ -147,7 +177,6 @@ def get_worksheet(title, headers):
         ws = sh.add_worksheet(title=title, rows=1000, cols=max(len(headers), 12))
         ws.append_row(headers, value_input_option="USER_ENTERED")
         return ws
-    # Лист есть — проверим, есть ли шапка
     first = ws.row_values(1)
     if not first:
         ws.append_row(headers, value_input_option="USER_ENTERED")
@@ -164,14 +193,49 @@ def get_sales_ws():
 
 # ---------- Чтение/запись данных ----------
 
-def get_existing_dates_production():
+def _fractions_signature(data):
+    """NEW: подпись записи по фракциям (для сравнения дублей).
+    Кортеж из 5 чисел фракций — устойчив к разнице в ФИО/примечании."""
+    return (
+        parse_num(data.get("фракция_0_1", 0)),
+        parse_num(data.get("фракция_1_2", 0)),
+        parse_num(data.get("фракция_2_4", 0)),
+        parse_num(data.get("фракция_4_6", 0)),
+        parse_num(data.get("фракция_6_8", 0)),
+    )
+
+
+def find_duplicate_production(data):
+    """NEW: ищет в складе строку с той же датой И теми же фракциями.
+    Возвращает True, если такая уже есть (вероятный дубль того же бланка).
+    Разные смены за один день с разными цифрами дублем НЕ считаются."""
     ws = get_production_ws()
-    dates = set()
-    col = ws.col_values(1)  # колонка "Дата"
-    for val in col[1:]:  # пропускаем шапку
-        if val:
-            dates.add(str(val).strip())
-    return dates
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
+        return False
+
+    target_dt = parse_date_or_none(data.get("дата", ""))
+    target_sig = _fractions_signature(data)
+
+    for r in rows[1:]:
+        row_date = r[0] if len(r) > 0 else ""
+        # сравниваем даты по смыслу (а не по тексту): 08.06.2026 == 8.6.26
+        row_dt = parse_date_or_none(row_date)
+        same_date = False
+        if target_dt and row_dt:
+            same_date = (target_dt.date() == row_dt.date())
+        else:
+            same_date = (str(row_date).strip() == str(data.get("дата", "")).strip())
+        if not same_date:
+            continue
+        # сравниваем фракции (индексы 5..9 в PROD_HEADERS)
+        row_sig = tuple(
+            parse_num(r[i]) if i < len(r) else 0
+            for i in range(5, 10)
+        )
+        if row_sig == target_sig:
+            return True
+    return False
 
 
 def save_production(data):
@@ -207,7 +271,7 @@ def save_sale(data):
         data.get("тип_расчета", ""),
         data.get("фракция", ""),
         qty_kg,
-        parse_num(data.get("цена_за_кг", 0)),  # CHANGED: новая колонка "Цена за кг"
+        parse_num(data.get("цена_за_кг", 0)),
         parse_num(data.get("сумма_с_ндс", 0)),
         parse_num(data.get("сумма_ндс", 0)),
         data.get("примечание", ""),
@@ -215,43 +279,28 @@ def save_sale(data):
     ws.append_row(row, value_input_option="USER_ENTERED")
 
 
-# ---------- NEW: запись реализации в отчёт "Реализация 2026г" ----------
+# ---------- запись реализации в отчёт "Реализация 2026г" ----------
 
 def _normalize_fraction(frac_text):
-    """Из произвольного текста фракции выделяет канон '0-1'/'1-2'/.../'6-8'."""
     for f in FRACTIONS:
         if f in str(frac_text):
             return f
     return None
 
 
-def _parse_sale_date(date_text):
-    """Пытается распарсить дату 'дд.мм.гггг'. Возвращает datetime или None."""
-    s = str(date_text).strip()
-    for fmt in ("%d.%m.%Y", "%d.%m.%y"):
-        try:
-            return datetime.strptime(s, fmt)
-        except Exception:
-            continue
-    return None
-
-
 def _get_or_create_month_sheet(sh, dt):
-    """Находит вкладку месяца ('июнь 2026'); если нет — копирует ШАБЛОН и переименовывает."""
     title = f"{RU_MONTHS[dt.month]} {dt.year}"
     try:
         return sh.worksheet(title)
     except gspread.WorksheetNotFound:
         pass
-    # Листа нет — создаём из шаблона
-    template = sh.worksheet(REPORT_TEMPLATE)  # бросит WorksheetNotFound, если шаблона нет
+    template = sh.worksheet(REPORT_TEMPLATE)
     new_ws = template.duplicate(new_sheet_name=title)
     return new_ws
 
 
 def write_sale_to_report(data):
-    """Дописывает строку реализации в отчёт. Возвращает (ok: bool, msg: str).
-    Не бросает наружу — ошибки ловит вызывающий код по флагу."""
+    """Дописывает строку реализации в отчёт. Возвращает (ok: bool, msg: str)."""
     pay = str(data.get("тип_расчета", "")).strip()
     if pay not in REPORT_BLOCKS:
         return False, f"тип расчёта не распознан ('{pay}') — строка в отчёт не добавлена"
@@ -260,7 +309,7 @@ def write_sale_to_report(data):
     if frac is None:
         return False, "фракция не распознана — строка в отчёт не добавлена"
 
-    dt = _parse_sale_date(data.get("дата", ""))
+    dt = parse_date_or_none(data.get("дата", ""))
     if dt is None:
         return False, "дата не распознана — строка в отчёт не добавлена"
 
@@ -268,8 +317,7 @@ def write_sale_to_report(data):
     ws = _get_or_create_month_sheet(sh, dt)
 
     start_row, end_row = REPORT_BLOCKS[pay]
-    # Ищем первую свободную строку блока (пустой столбец B = Дата)
-    date_col_vals = ws.col_values(REPORT_DATE_COL)  # значения столбца B сверху вниз
+    date_col_vals = ws.col_values(REPORT_DATE_COL)
     target_row = None
     for r in range(start_row, end_row + 1):
         val = date_col_vals[r - 1] if r - 1 < len(date_col_vals) else ""
@@ -287,7 +335,6 @@ def write_sale_to_report(data):
 
     qcol, pcol, scol = REPORT_FRAC_COLS[frac]
 
-    # Готовим точечные обновления ячеек
     updates = [
         {"range": gspread.utils.rowcol_to_a1(target_row, REPORT_DATE_COL),
          "values": [[dt.strftime("%d.%m.%Y")]]},
@@ -307,7 +354,6 @@ def calc_stock():
     income = {k: 0 for k in FRACTIONS}
     ws_p = get_production_ws()
     rows = ws_p.get_all_values()
-    # колонки фракций: индексы 5..9 (0-based) при PROD_HEADERS
     for r in rows[1:]:
         for i, key in enumerate(FRACTIONS, 5):
             if i < len(r):
@@ -319,7 +365,6 @@ def calc_stock():
     outcome = {k: 0 for k in FRACTIONS}
     ws_s = get_sales_ws()
     rows_s = ws_s.get_all_values()
-    # Реализация: Фракция = индекс 3, Количество кг = индекс 4
     for r in rows_s[1:]:
         frac = r[3] if len(r) > 3 else ""
         qty = r[4] if len(r) > 4 else 0
@@ -371,13 +416,25 @@ async def recognize_production(image_bytes: bytes):
 На фото может быть одна или несколько строк. Верни ТОЛЬКО JSON без markdown.
 Если одна строка — объект, если несколько — массив объектов. Формат:
 {"дата":"дд.мм.гггг","фио":"ФИО","вес_шин":0,"мешки":0,"нитки":0,"фракция_0_1":0,"фракция_1_2":0,"фракция_2_4":0,"фракция_4_6":0,"фракция_6_8":0,"металл_корд":0,"примечание":""}
-Если не читается — 0."""
+
+ВАЖНО про ДАТУ:
+- На бланке дату часто пишут слитно, без нулей и точек: формат деньмесяцгод.
+  Пример: "5626" означает 5.6.26 -> верни "05.06.2026".
+  Пример: "151226" означает 15.12.26 -> верни "15.12.2026".
+- Год пишут двумя цифрами (26), это 2026 -> в ответе год всегда 4 цифры (2026).
+- В ответе дата ВСЕГДА в виде "дд.мм.гггг" с точками и ведущими нулями.
+
+ВАЖНО про ФРАКЦИИ:
+- В одной ячейке фракции может стоять ДВА числа: верхнее = мешки (штуки), нижнее = килограммы.
+- Бери ВСЕГДА НИЖНЕЕ число (килограммы). Верхнее (мешки) игнорируй.
+- Если число одно — это килограммы.
+
+Если что-то не читается — ставь 0."""
     return await call_claude(image_b64, prompt)
 
 
 async def recognize_sale(image_bytes: bytes):
     image_b64 = base64.b64encode(image_bytes).decode()
-    # CHANGED: добавлено поле цена_за_кг
     prompt = """Это фото накладной на отпуск/реализацию резиновой крошки.
 Распознай данные и верни ТОЛЬКО JSON без markdown:
 {"дата":"дд.мм.гггг","покупатель":"название организации или ИП","фракция":"например 2-4","количество_т":0.0,"количество_кг":0,"цена_за_кг":0,"сумма_с_ндс":0,"сумма_ндс":0,"примечание":""}
@@ -385,7 +442,7 @@ async def recognize_sale(image_bytes: bytes):
 Цену бери из колонки "цена" (цена за 1 кг). Бери ровно как в накладной, не пересчитывай.
 Сумму с НДС бери из колонки "Сумма с НДС" (полная сумма включая НДС).
 Сумму НДС бери из колонки "Сумма НДС" (только НДС). Если НДС в накладной нет — поставь 0.
-Если не читается — 0."""
+Дату верни в виде "дд.мм.гггг". Если не читается — 0."""
     return await call_claude(image_b64, prompt)
 
 
@@ -442,7 +499,7 @@ async def last_records(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     ws = get_production_ws()
     rows = ws.get_all_values()
-    data_rows = rows[1:]  # без шапки
+    data_rows = rows[1:]
     if not data_rows:
         await update.message.reply_text("📭 Записей пока нет.")
         return
@@ -476,8 +533,16 @@ async def manual_prod_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def manual_prod_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t.lower() == "сегодня":
-        t = datetime.now().strftime("%d.%m.%Y")
-    context.user_data["prod"]["дата"] = t
+        context.user_data["prod"]["дата"] = datetime.now().strftime("%d.%m.%Y")
+    else:
+        dt = parse_date_or_none(t)
+        if dt is None:
+            await update.message.reply_text(
+                "⚠️ Не понял дату. Введи в виде ДД.ММ.ГГГГ (например 05.06.2026)\n"
+                "или напиши «сегодня». Для отмены — /cancel"
+            )
+            return P_DATE
+        context.user_data["prod"]["дата"] = date_to_str(dt)
     await update.message.reply_text("👤 ФИО оператора?")
     return P_FIO
 
@@ -542,21 +607,12 @@ async def manual_prod_cord(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return P_NOTE
 
 
-async def manual_prod_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    note = update.message.text.strip()
-    context.user_data["prod"]["примечание"] = "" if note in ("-", "—") else note
-    d = context.user_data["prod"]
-
-    existing = get_existing_dates_production()
-    dup_note = ""
-    if str(d.get("дата", "")).strip() in existing:
-        dup_note = "\n\n⚠️ Запись с этой датой уже есть — добавлю ещё одну строку."
-
-    save_production(d)
+def _prod_summary(d):
+    """Текст-подтверждение сохранённой записи производства."""
     total = (parse_num(d.get("фракция_0_1", 0)) + parse_num(d.get("фракция_1_2", 0))
              + parse_num(d.get("фракция_2_4", 0)) + parse_num(d.get("фракция_4_6", 0))
              + parse_num(d.get("фракция_6_8", 0)))
-    reply = (
+    return (
         f"✅ *Производство сохранено!*\n\n"
         f"📅 Дата: {d.get('дата', '—')}\n"
         f"👤 Оператор: {d.get('фио', '—')}\n"
@@ -569,9 +625,25 @@ async def manual_prod_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  4-6: {d.get('фракция_4_6', 0)}\n"
         f"  6-8: {d.get('фракция_6_8', 0)}\n"
         f"  Всего: {total} кг\n\n"
-        f"🔩 Металлокорд: {d.get('металл_корд', 0)} кг" + dup_note
+        f"🔩 Металлокорд: {d.get('металл_корд', 0)} кг"
     )
-    await update.message.reply_text(reply, parse_mode="Markdown")
+
+
+async def manual_prod_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    note = update.message.text.strip()
+    context.user_data["prod"]["примечание"] = "" if note in ("-", "—") else note
+    d = context.user_data["prod"]
+
+    # NEW: при ручном вводе тоже предупреждаем о вероятном дубле (но сохраняем — это явное действие человека)
+    dup_note = ""
+    try:
+        if find_duplicate_production(d):
+            dup_note = "\n\n⚠️ Похоже, запись с этой датой и теми же фракциями уже есть — добавил ещё одну (ручной ввод)."
+    except Exception as e:
+        logger.error(f"dup check error (manual): {e}")
+
+    save_production(d)
+    await update.message.reply_text(_prod_summary(d) + dup_note, parse_mode="Markdown")
     context.user_data.pop("prod", None)
     return ConversationHandler.END
 
@@ -595,8 +667,16 @@ async def manual_sale_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def manual_sale_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t.lower() == "сегодня":
-        t = datetime.now().strftime("%d.%m.%Y")
-    context.user_data["sale"]["дата"] = t
+        context.user_data["sale"]["дата"] = datetime.now().strftime("%d.%m.%Y")
+    else:
+        dt = parse_date_or_none(t)
+        if dt is None:
+            await update.message.reply_text(
+                "⚠️ Не понял дату. Введи в виде ДД.ММ.ГГГГ (например 05.06.2026)\n"
+                "или напиши «сегодня». Для отмены — /cancel"
+            )
+            return S_DATE
+        context.user_data["sale"]["дата"] = date_to_str(dt)
     await update.message.reply_text("🏢 Покупатель?")
     return S_BUYER
 
@@ -639,13 +719,11 @@ async def manual_sale_frac(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def manual_sale_kg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["sale"]["количество_кг"] = parse_num(update.message.text)
-    # CHANGED: теперь спрашиваем цену за кг
     await update.message.reply_text("💵 Цена за кг, тнг? (как в накладной)")
     return S_PRICE
 
 
 async def manual_sale_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # NEW: шаг "цена за кг"
     context.user_data["sale"]["цена_за_кг"] = parse_num(update.message.text)
     await update.message.reply_text("💰 Сумма с НДС, тнг?")
     return S_SUM_VAT
@@ -669,7 +747,6 @@ async def manual_sale_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = context.user_data["sale"]
     save_sale(d)
 
-    # NEW: дописываем в отчёт; ошибка отчёта не валит сохранение в склад
     report_line = ""
     try:
         ok, msg = write_sale_to_report(d)
@@ -698,7 +775,8 @@ async def manual_sale_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("prod", None)
     context.user_data.pop("sale", None)
-    await update.message.reply_text("❌ Ручной ввод отменён.")
+    context.user_data.pop("pending_prod", None)
+    await update.message.reply_text("❌ Отменено.")
     return ConversationHandler.END
 
 
@@ -719,10 +797,42 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Используй кнопки меню или команды /ostatok, /last")
 
 
+async def _save_sale_from_photo(update, data):
+    """Сохранение реализации с фото + попытка записи в отчёт (вынесено для чистоты)."""
+    data.setdefault("тип_расчета", "")
+    save_sale(data)
+
+    report_line = ""
+    try:
+        ok, msg = write_sale_to_report(data)
+        report_line = ("\n🧾 Отчёт: " + msg) if ok else ("\n⚠️ Отчёт: " + msg)
+    except Exception as e:
+        logger.error(f"Report write error: {e}")
+        report_line = "\n⚠️ Отчёт: не удалось записать (склад сохранён)."
+
+    qty_kg = parse_num(data.get("количество_кг", 0))
+    if not qty_kg and data.get("количество_т"):
+        qty_kg = parse_num(data.get("количество_т", 0)) * 1000
+    reply = (
+        f"✅ *Реализация сохранена!*\n\n"
+        f"📅 Дата: {data.get('дата', '—')}\n"
+        f"🏢 Покупатель: {data.get('покупатель', '—')}\n"
+        f"💳 Тип расчёта: {data.get('тип_расчета') or '— (уточни вручную)'}\n"
+        f"📦 Фракция: {data.get('фракция', '—')}\n"
+        f"⚖️ Количество: {qty_kg:.0f} кг\n"
+        f"💵 Цена за кг: {data.get('цена_за_кг', 0)} тнг\n"
+        f"💰 Сумма с НДС: {data.get('сумма_с_ндс', 0)} тнг\n"
+        f"💰 Сумма НДС: {data.get('сумма_ндс', 0)} тнг" + report_line
+    )
+    await update.message.reply_text(reply, parse_mode="Markdown")
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Точка входа фото. Для реализации — пишет сразу.
+    Для производства — распознаёт и, если дубль, переспрашивает (возвращает PHOTO_PROD_CONFIRM)."""
     if not is_allowed(update):
         await update.message.reply_text("⛔ Нет доступа. Обратитесь к администратору.")
-        return
+        return ConversationHandler.END
     photo_type = context.user_data.get("photo_type", "production")
     await update.message.reply_text("📸 Получил фото, распознаю данные...")
 
@@ -734,69 +844,83 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if photo_type == "sale":
             data = await recognize_sale(image_bytes)
             logger.info(f"Sale data: {data}")
-            # Тип расчёта с фото не всегда виден — по умолчанию пусто, уточнит вручную при необходимости
-            data.setdefault("тип_расчета", "")
-            save_sale(data)
-
-            # NEW: пробуем дописать в отчёт (только если тип расчёта распознан)
-            report_line = ""
-            try:
-                ok, msg = write_sale_to_report(data)
-                report_line = ("\n🧾 Отчёт: " + msg) if ok else ("\n⚠️ Отчёт: " + msg)
-            except Exception as e:
-                logger.error(f"Report write error: {e}")
-                report_line = "\n⚠️ Отчёт: не удалось записать (склад сохранён)."
-
-            qty_kg = parse_num(data.get("количество_кг", 0))
-            if not qty_kg and data.get("количество_т"):
-                qty_kg = parse_num(data.get("количество_т", 0)) * 1000
-            reply = (
-                f"✅ *Реализация сохранена!*\n\n"
-                f"📅 Дата: {data.get('дата', '—')}\n"
-                f"🏢 Покупатель: {data.get('покупатель', '—')}\n"
-                f"💳 Тип расчёта: {data.get('тип_расчета') or '— (уточни вручную)'}\n"
-                f"📦 Фракция: {data.get('фракция', '—')}\n"
-                f"⚖️ Количество: {qty_kg:.0f} кг\n"
-                f"💵 Цена за кг: {data.get('цена_за_кг', 0)} тнг\n"
-                f"💰 Сумма с НДС: {data.get('сумма_с_ндс', 0)} тнг\n"
-                f"💰 Сумма НДС: {data.get('сумма_ндс', 0)} тнг" + report_line
-            )
-            await update.message.reply_text(reply, parse_mode="Markdown")
+            await _save_sale_from_photo(update, data)
             context.user_data["photo_type"] = "production"
+            return ConversationHandler.END
 
-        else:
-            data = await recognize_production(image_bytes)
-            logger.info(f"Production data: {data}")
-            existing_dates = get_existing_dates_production()
-            records = data if isinstance(data, list) else [data]
-            new_records = [r for r in records if str(r.get("дата", "")).strip() not in existing_dates]
-            skipped = len(records) - len(new_records)
+        # --- производство ---
+        data = await recognize_production(image_bytes)
+        logger.info(f"Production data: {data}")
+        records = data if isinstance(data, list) else [data]
 
-            if not new_records:
-                await update.message.reply_text("⚠️ Все записи с этого фото уже есть в таблице.")
-                return
+        # Проверяем дату КАЖДОЙ записи. Claude должен был отдать дд.мм.гггг.
+        # Если дата не читается — НЕ пишем молча, а просим ввести вручную.
+        bad_date = []
+        for r in records:
+            dt = parse_date_or_none(r.get("дата", ""))
+            if dt is None:
+                bad_date.append(r)
+            else:
+                r["дата"] = date_to_str(dt)  # приводим к единому виду дд.мм.гггг
 
-            for item in new_records:
-                save_production(item)
-
-            first = new_records[-1]
-            reply = (
-                f"✅ *Производство сохранено!*\n"
-                f"_Новых: {len(new_records)}"
-                + (f" | Дублей пропущено: {skipped}" if skipped > 0 else "") +
-                "_\n\n"
-                f"📅 Дата: {first.get('дата', '—')}\n"
-                f"👤 Оператор: {first.get('фио', '—')}\n"
-                f"⚖️ Вес шин: {first.get('вес_шин', 0)} кг\n\n"
-                f"*Фракции (кг):*\n"
-                f"  0-1: {first.get('фракция_0_1', 0)}\n"
-                f"  1-2: {first.get('фракция_1_2', 0)}\n"
-                f"  2-4: {first.get('фракция_2_4', 0)}\n"
-                f"  4-6: {first.get('фракция_4_6', 0)}\n"
-                f"  6-8: {first.get('фракция_6_8', 0)}\n\n"
-                f"🔩 Металлокорд: {first.get('металл_корд', 0)} кг"
+        if bad_date:
+            await update.message.reply_text(
+                "⚠️ Не смог уверенно прочитать ДАТУ на фото.\n\n"
+                "Чтобы не записать неверно, внеси эту смену через «✍️ Ввод производства» "
+                "(там дату введёшь вручную), или переснимай фото так, чтобы дата была чёткой "
+                "и с точками (например 05.06.2026).\n\n"
+                "В склад с этого фото ничего не записал."
             )
-            await update.message.reply_text(reply, parse_mode="Markdown")
+            return ConversationHandler.END
+
+        # Делим на «чистые» (сразу пишем) и «вероятные дубли» (спросим)
+        clean, dups = [], []
+        for r in records:
+            try:
+                if find_duplicate_production(r):
+                    dups.append(r)
+                else:
+                    clean.append(r)
+            except Exception as e:
+                logger.error(f"dup check error (photo): {e}")
+                clean.append(r)  # если проверка упала — не теряем данные, пишем
+
+        # Чистые записи сохраняем сразу
+        for item in clean:
+            save_production(item)
+
+        # Если есть подозрение на дубль — спрашиваем по первому, остальные дубли держим в очереди
+        if dups:
+            context.user_data["pending_prod"] = dups
+            first_dup = dups[0]
+            sig_total = sum(_fractions_signature(first_dup))
+            saved_note = ""
+            if clean:
+                saved_note = f"\n\n(Заодно сохранил новых записей: {len(clean)}.)"
+            kb = ReplyKeyboardMarkup([["Да, добавить", "Нет, пропустить"]],
+                                     resize_keyboard=True, one_time_keyboard=True)
+            await update.message.reply_text(
+                f"⚠️ Похоже, эта запись УЖЕ ЕСТЬ в складе:\n\n"
+                f"📅 Дата: {first_dup.get('дата', '—')}\n"
+                f"👤 Оператор: {first_dup.get('фио', '—')}\n"
+                f"⚖️ Всего крошки: {sig_total:.0f} кг\n\n"
+                f"Добавить её всё равно?" + saved_note,
+                reply_markup=kb,
+                parse_mode="Markdown"
+            )
+            return PHOTO_PROD_CONFIRM
+
+        # Дублей нет — обычный отчёт
+        if not clean:
+            await update.message.reply_text("⚠️ С фото не удалось получить данные. Попробуй ещё раз.")
+            return ConversationHandler.END
+
+        first = clean[-1]
+        await update.message.reply_text(
+            _prod_summary(first).replace("сохранено!", f"сохранено! (новых: {len(clean)})"),
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
 
     except Exception as e:
         logger.error(f"Error: {e}")
@@ -806,6 +930,31 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Хорошее освещение\n"
             "• Всё в кадре"
         )
+        return ConversationHandler.END
+
+
+async def photo_prod_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """NEW: ответ Да/Нет на вопрос о дубле фото-производства."""
+    ans = update.message.text.strip().lower()
+    dups = context.user_data.get("pending_prod", [])
+    context.user_data.pop("pending_prod", None)
+
+    if not dups:
+        await update.message.reply_text("Нечего подтверждать. Отправь фото заново.")
+        return ConversationHandler.END
+
+    if "да" in ans:
+        for item in dups:
+            save_production(item)
+        await update.message.reply_text(
+            f"✅ Добавил, несмотря на совпадение. Записей: {len(dups)}.\n"
+            f"Проверь остаток: /ostatok"
+        )
+    else:
+        await update.message.reply_text(
+            "👍 Пропустил — дубль в склад не попал."
+        )
+    return ConversationHandler.END
 
 
 def main():
@@ -838,10 +987,20 @@ def main():
             S_PAYTYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_paytype)],
             S_FRAC: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_frac)],
             S_KG: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_kg)],
-            S_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_price)],  # NEW
+            S_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_price)],
             S_SUM_VAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_sum_vat)],
             S_VAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_vat)],
             S_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_note)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    # NEW: диалог фото-производства с подтверждением дубля.
+    # entry_point — приход фото; если дубль, переходим в PHOTO_PROD_CONFIRM и ждём Да/Нет.
+    photo_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.PHOTO, handle_photo)],
+        states={
+            PHOTO_PROD_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_prod_confirm)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
@@ -852,7 +1011,7 @@ def main():
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(prod_conv)
     app.add_handler(sale_conv)
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(photo_conv)  # вместо прямого MessageHandler(filters.PHOTO, ...)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     if WEBHOOK_URL:
