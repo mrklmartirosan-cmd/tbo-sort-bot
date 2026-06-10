@@ -60,7 +60,8 @@ RU_MONTHS = {
 (P_DATE, P_FIO, P_TIRES, P_BAGS, P_THREAD, P_F01, P_F12, P_F24, P_F46, P_F68, P_CORD, P_NOTE) = range(12)
 (S_DATE, S_BUYER, S_PAYTYPE, S_FRAC, S_KG, S_PRICE, S_SUM_VAT, S_VAT, S_NOTE) = range(12, 21)
 # NEW: состояние подтверждения дубля при фото-производстве
-(PHOTO_PROD_CONFIRM,) = range(21, 22)
+# + доспрос нал/безнал после фото-реализации (чтобы продажа попала в отчёт)
+(PHOTO_PROD_CONFIRM, PHOTO_SALE_PAY) = range(21, 23)
 
 FRACTIONS = ["0-1", "1-2", "2-4", "4-6", "6-8"]
 
@@ -772,6 +773,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("prod", None)
     context.user_data.pop("sale", None)
     context.user_data.pop("pending_prod", None)
+    context.user_data.pop("pending_sale", None)
     await update.message.reply_text("❌ Отменено.")
     return ConversationHandler.END
 
@@ -823,6 +825,24 @@ async def _save_sale_from_photo(update, data):
     await update.message.reply_text(reply, parse_mode="Markdown")
 
 
+async def photo_sale_paytype(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Доспрос нал/безнал после фото-реализации, затем запись в склад и отчёт."""
+    val = update.message.text.strip().lower()
+    if "нал" in val and "без" not in val:
+        pay = "Наличный"
+    elif "без" in val:
+        pay = "Безналичный"
+    else:
+        await update.message.reply_text("⚠️ Выбери: Безналичный или Наличный")
+        return PHOTO_SALE_PAY
+    data = context.user_data.get("pending_sale", {})
+    data["тип_расчета"] = pay
+    await _save_sale_from_photo(update, data)
+    context.user_data.pop("pending_sale", None)
+    context.user_data["photo_type"] = "production"
+    return ConversationHandler.END
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Точка входа фото. Для реализации — пишет сразу.
     Для производства — распознаёт и, если дубль, переспрашивает (возвращает PHOTO_PROD_CONFIRM)."""
@@ -840,6 +860,24 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if photo_type == "sale":
             data = await recognize_sale(image_bytes)
             logger.info(f"Sale data: {data}")
+            # тип расчёта (нал/безнал) на накладной обычно не виден — нормализуем распознанное
+            pay_raw = str(data.get("тип_расчета", "")).strip().lower()
+            if "нал" in pay_raw and "без" not in pay_raw:
+                data["тип_расчета"] = "Наличный"
+            elif "без" in pay_raw:
+                data["тип_расчета"] = "Безналичный"
+            else:
+                data["тип_расчета"] = ""
+            if not data["тип_расчета"]:
+                # доспрашиваем, чтобы продажа попала и в отчёт «Реализация 2026г»
+                context.user_data["pending_sale"] = data
+                kb = ReplyKeyboardMarkup([["Безналичный", "Наличный"]],
+                                         resize_keyboard=True, one_time_keyboard=True)
+                await update.message.reply_text(
+                    "📄 Накладную распознал. Уточни тип расчёта, чтобы продажа попала и в отчёт:",
+                    reply_markup=kb,
+                )
+                return PHOTO_SALE_PAY
             await _save_sale_from_photo(update, data)
             context.user_data["photo_type"] = "production"
             return ConversationHandler.END
@@ -996,6 +1034,7 @@ def main():
         entry_points=[MessageHandler(filters.PHOTO, handle_photo)],
         states={
             PHOTO_PROD_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_prod_confirm)],
+            PHOTO_SALE_PAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_sale_paytype)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
