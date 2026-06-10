@@ -3,14 +3,17 @@ import json
 import base64
 import logging
 import re
-from datetime import datetime
-from telegram import Update, ReplyKeyboardMarkup
+import io
+import asyncio
+from datetime import datetime, timezone, timedelta
+from telegram import Update, ReplyKeyboardMarkup, InputFile
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
     ContextTypes, ConversationHandler
 )
 import httpx
 import gspread
+import openpyxl
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,6 +35,12 @@ SHEET_SALES = "Реализация"
 # Пустой список = пускать всех (страховка, чтобы не заблокировать себя).
 _allowed_raw = os.environ.get("ALLOWED_USERS", "")
 ALLOWED_USERS = {int(x) for x in _allowed_raw.replace(" ", "").split(",") if x.strip().isdigit()}
+
+# --- Автобэкап ---
+BACKUP_CHANNEL_ID = os.environ.get("BACKUP_CHANNEL_ID", "")
+KZ_TZ = timezone(timedelta(hours=5))
+BACKUP_HOUR = 22
+_last_backup_counts = {}
 
 # --- настройки отчёта реализации ---------------------------------
 REPORT_TEMPLATE = "ШАБЛОН"                 # лист-образец (пустой бланк)
@@ -1078,8 +1087,106 @@ async def photo_prod_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 
+# ---------- Автобэкап данных в закрытый Telegram-канал ----------
+
+def _build_backup_xlsx():
+    """Собирает один .xlsx: листы склада (Производство, Реализация) + вкладки отчёта реализации.
+    Возвращает (bytes_файла, counts) — counts это число строк данных по ключевым листам."""
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    counts = {}
+    book = get_spreadsheet()
+    for name in ("Производство", "Реализация"):
+        try:
+            rows = book.worksheet(name).get_all_values()
+        except Exception as e:
+            logger.error(f"backup read {name}: {e}")
+            rows = [["(не удалось прочитать лист)"]]
+        sheet = wb.create_sheet(name[:31])
+        for row in rows:
+            sheet.append(row)
+        counts[name] = max(0, len(rows) - 1)
+    try:
+        rep = get_report_spreadsheet()
+        for ws in rep.worksheets():
+            rows = ws.get_all_values()
+            sheet = wb.create_sheet(("Отчёт-" + ws.title)[:31])
+            for row in rows:
+                sheet.append(row)
+    except Exception as e:
+        logger.error(f"backup read report: {e}")
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue(), counts
+
+
+async def do_backup(bot):
+    """Собирает и отправляет бэкап в закрытый канал. Возвращает 'ok' или текст ошибки."""
+    if not BACKUP_CHANNEL_ID:
+        logger.warning("BACKUP_CHANNEL_ID не задан — бэкап пропущен")
+        return "не задан BACKUP_CHANNEL_ID"
+    data, counts = await asyncio.to_thread(_build_backup_xlsx)
+    global _last_backup_counts
+    warn = ""
+    for key in ("Производство", "Реализация"):
+        old = _last_backup_counts.get(key)
+        new = counts.get(key, 0)
+        if old is not None and (old - new) > 2:
+            warn += f"\n⚠️ В «{key}» строк стало МЕНЬШЕ: было {old}, стало {new}. Проверь, не удалили ли случайно!"
+    _last_backup_counts = counts
+    now = datetime.now(KZ_TZ)
+    fname = "edil_backup_" + now.strftime("%Y-%m-%d_%H%M") + ".xlsx"
+    caption = ("🗄 Бэкап Едил · " + now.strftime("%d.%m.%Y %H:%M")
+               + f"\nПроизводство: {counts.get('Производство', 0)} · Реализация: {counts.get('Реализация', 0)} строк")
+    if warn:
+        caption += "\n" + warn
+    await bot.send_document(
+        chat_id=int(BACKUP_CHANNEL_ID),
+        document=InputFile(io.BytesIO(data), filename=fname),
+        caption=caption,
+    )
+    return "ok"
+
+
+async def _backup_loop(application):
+    """Раз в сутки в BACKUP_HOUR по местному времени (UTC+5) делает бэкап."""
+    await asyncio.sleep(10)
+    while True:
+        now = datetime.now(KZ_TZ)
+        target = now.replace(hour=BACKUP_HOUR, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await asyncio.sleep(max(1, (target - now).total_seconds()))
+        try:
+            await do_backup(application.bot)
+        except Exception as e:
+            logger.error(f"scheduled backup error: {e}")
+
+
+async def _post_init(application):
+    application.create_task(_backup_loop(application))
+
+
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ручной запуск бэкапа для проверки. Только для разрешённых пользователей."""
+    if not is_allowed(update):
+        await update.message.reply_text("⛔ Нет доступа.")
+        return
+    await update.message.reply_text("🗄 Делаю бэкап, пара секунд...")
+    try:
+        res = await do_backup(context.bot)
+    except Exception as e:
+        logger.error(f"manual backup error: {e}")
+        await update.message.reply_text(f"❌ Ошибка бэкапа: {e}")
+        return
+    if res == "ok":
+        await update.message.reply_text("✅ Бэкап отправлен в канал.")
+    else:
+        await update.message.reply_text(f"⚠️ {res}")
+
+
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
 
     prod_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^✍️ Ввод производства$"), manual_prod_start)],
@@ -1131,6 +1238,7 @@ def main():
     app.add_handler(CommandHandler("ostatok", ostatok))
     app.add_handler(CommandHandler("last", last_records))
     app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("backup", cmd_backup))
     app.add_handler(prod_conv)
     app.add_handler(sale_conv)
     app.add_handler(photo_conv)  # вместо прямого MessageHandler(filters.PHOTO, ...)
