@@ -246,11 +246,12 @@ def save_production(data):
     f46 = parse_num(data.get("фракция_4_6", 0))
     f68 = parse_num(data.get("фракция_6_8", 0))
     total = f01 + f12 + f24 + f46 + f68
+    bags = round(total / 30) if total else 0  # 1 мешок = 30 кг; считаем сами, не из распознавания
     row = [
         data.get("дата", datetime.now().strftime("%d.%m.%Y")),
         data.get("фио", ""),
         parse_num(data.get("вес_шин", 0)),
-        parse_num(data.get("мешки", 0)),
+        bags,
         parse_num(data.get("нитки", 0)),
         f01, f12, f24, f46, f68,
         total,
@@ -555,12 +556,6 @@ async def manual_prod_fio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def manual_prod_tires(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["prod"]["вес_шин"] = parse_num(update.message.text)
-    await update.message.reply_text("🛍 Мешки, шт?")
-    return P_BAGS
-
-
-async def manual_prod_bags(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["prod"]["мешки"] = parse_num(update.message.text)
     await update.message.reply_text("🧵 Нитки, кг? (или «-» если нет)")
     return P_THREAD
 
@@ -612,12 +607,13 @@ def _prod_summary(d):
     total = (parse_num(d.get("фракция_0_1", 0)) + parse_num(d.get("фракция_1_2", 0))
              + parse_num(d.get("фракция_2_4", 0)) + parse_num(d.get("фракция_4_6", 0))
              + parse_num(d.get("фракция_6_8", 0)))
+    bags = round(total / 30) if total else 0
     return (
         f"✅ *Производство сохранено!*\n\n"
         f"📅 Дата: {d.get('дата', '—')}\n"
         f"👤 Оператор: {d.get('фио', '—')}\n"
         f"⚖️ Вес шин: {d.get('вес_шин', 0)} кг\n"
-        f"🛍 Мешки: {d.get('мешки', 0)} шт\n\n"
+        f"🛍 Мешки: {bags} шт (всего ÷ 30)\n\n"
         f"*Фракции (кг):*\n"
         f"  0-1: {d.get('фракция_0_1', 0)}\n"
         f"  1-2: {d.get('фракция_1_2', 0)}\n"
@@ -966,7 +962,6 @@ def main():
             P_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_prod_date)],
             P_FIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_prod_fio)],
             P_TIRES: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_prod_tires)],
-            P_BAGS: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_prod_bags)],
             P_THREAD: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_prod_thread)],
             P_F01: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_prod_f01)],
             P_F12: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_prod_f12)],
