@@ -61,7 +61,7 @@ RU_MONTHS = {
 (S_DATE, S_BUYER, S_PAYTYPE, S_FRAC, S_KG, S_PRICE, S_SUM_VAT, S_VAT, S_NOTE) = range(12, 21)
 # NEW: состояние подтверждения дубля при фото-производстве
 # + доспрос нал/безнал после фото-реализации (чтобы продажа попала в отчёт)
-(PHOTO_PROD_CONFIRM, PHOTO_SALE_PAY) = range(21, 23)
+(PHOTO_PROD_CONFIRM, PHOTO_SALE_PAY, PHOTO_TYPE_CONFIRM) = range(21, 24)
 
 FRACTIONS = ["0-1", "1-2", "2-4", "4-6", "6-8"]
 
@@ -774,6 +774,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("sale", None)
     context.user_data.pop("pending_prod", None)
     context.user_data.pop("pending_sale", None)
+    context.user_data.pop("pending_photo", None)
     await update.message.reply_text("❌ Отменено.")
     return ConversationHandler.END
 
@@ -843,20 +844,82 @@ async def photo_sale_paytype(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 
+async def detect_doc_type(image_bytes: bytes):
+    """Определяет по фото: накладная-реализация или отчёт производства."""
+    image_b64 = base64.b64encode(image_bytes).decode()
+    prompt = (
+        "Определи тип документа на фото. Это одно из двух:\n"
+        "- НАКЛАДНАЯ на отпуск/реализацию (есть покупатель, цены, суммы, НДС) — это продажа;\n"
+        "- ОТЧЁТ ПРОИЗВОДСТВА крошки (смена, оператор, вес шин, фракции в кг, мешки).\n"
+        'Верни ТОЛЬКО JSON: {"тип":"реализация"} или {"тип":"производство"}.'
+    )
+    try:
+        res = await call_claude(image_b64, prompt)
+        t = str(res.get("тип", "")).strip().lower() if isinstance(res, dict) else ""
+    except Exception as e:
+        logger.error(f"detect_doc_type error: {e}")
+        t = ""
+    return "sale" if "реализ" in t else "production"
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Точка входа фото. Для реализации — пишет сразу.
-    Для производства — распознаёт и, если дубль, переспрашивает (возвращает PHOTO_PROD_CONFIRM)."""
+    """Приём фото: определяем тип (реализация/производство) и просим подтвердить."""
     if not is_allowed(update):
         await update.message.reply_text("⛔ Нет доступа. Обратитесь к администратору.")
         return ConversationHandler.END
-    photo_type = context.user_data.get("photo_type", "production")
-    await update.message.reply_text("📸 Получил фото, распознаю данные...")
-
+    await update.message.reply_text("📸 Получил фото, определяю тип документа...")
     try:
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
         image_bytes = bytes(await file.download_as_bytearray())
+        doc_type = await detect_doc_type(image_bytes)
+        context.user_data["pending_photo"] = {"file_id": photo.file_id, "type": doc_type}
+        if doc_type == "sale":
+            label, other = "📄 РЕАЛИЗАЦИЯ (накладная)", "🔁 Нет, это производство"
+        else:
+            label, other = "📸 ПРОИЗВОДСТВО (отчёт)", "🔁 Нет, это реализация"
+        kb = ReplyKeyboardMarkup([["✅ Да, верно", other]],
+                                 resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text(
+            f"Определил: {label}\n\nВерно? Подтверди — распознаю и сохраню.",
+            reply_markup=kb,
+        )
+        return PHOTO_TYPE_CONFIRM
+    except Exception as e:
+        logger.error(f"handle_photo detect error: {e}")
+        await update.message.reply_text("❌ Не смог обработать фото. Попробуй ещё раз.")
+        return ConversationHandler.END
 
+
+async def photo_type_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждение типа: Да — сохраняем; Нет — берём другой тип."""
+    ans = update.message.text.strip().lower()
+    pending = context.user_data.get("pending_photo")
+    if not pending:
+        await update.message.reply_text("Пришли фото заново, пожалуйста.")
+        return ConversationHandler.END
+    if "да" in ans or "верно" in ans:
+        photo_type = pending["type"]
+    elif "нет" in ans or "производ" in ans or "реализ" in ans:
+        photo_type = "production" if pending["type"] == "sale" else "sale"
+    else:
+        await update.message.reply_text("Нажми «✅ Да, верно» или «🔁 Нет…».")
+        return PHOTO_TYPE_CONFIRM
+    context.user_data.pop("pending_photo", None)
+    await update.message.reply_text("🔎 Принято, распознаю данные...")
+    try:
+        file = await context.bot.get_file(pending["file_id"])
+        image_bytes = bytes(await file.download_as_bytearray())
+    except Exception as e:
+        logger.error(f"photo_type_confirm download error: {e}")
+        await update.message.reply_text("❌ Не смог скачать фото. Пришли заново.")
+        return ConversationHandler.END
+    return await _dispatch_photo(update, context, photo_type, image_bytes)
+
+
+async def _dispatch_photo(update, context, photo_type, image_bytes):
+    """Распознаёт и сохраняет фото по подтверждённому типу."""
+    try:
         if photo_type == "sale":
             data = await recognize_sale(image_bytes)
             logger.info(f"Sale data: {data}")
@@ -1033,6 +1096,7 @@ def main():
     photo_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.PHOTO, handle_photo)],
         states={
+            PHOTO_TYPE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_type_confirm)],
             PHOTO_PROD_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_prod_confirm)],
             PHOTO_SALE_PAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_sale_paytype)],
         },
