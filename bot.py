@@ -1166,6 +1166,7 @@ async def _backup_loop(application):
             logger.error(f"scheduled backup error: {e}")
         try:
             await asyncio.to_thread(_build_svod)
+            await asyncio.to_thread(_build_sebes)
         except Exception as e:
             logger.error(f"scheduled svod error: {e}")
 
@@ -1461,6 +1462,103 @@ def _build_svod():
     return title, year
 
 
+def _build_sebes():
+    """Лист «Себестоимость (авто)»: по месяцам — производство, расходы по категориям, полная себестоимость, выручка, прибыль, себестоимость 1 кг."""
+    book = get_spreadsheet()
+    year = datetime.now().year
+    tyres = {m: 0.0 for m in range(1, 13)}
+    crumb = {m: 0.0 for m in range(1, 13)}
+    metal = {m: 0.0 for m in range(1, 13)}
+    rev = {m: 0.0 for m in range(1, 13)}
+    rev_novat = {m: 0.0 for m in range(1, 13)}
+    cat_sums = {}
+    try:
+        prows = book.worksheet("Производство").get_all_values()[1:]
+    except gspread.WorksheetNotFound:
+        prows = []
+    for row in prows:
+        if len(row) < 12:
+            row = row + [""] * (12 - len(row))
+        if "начальн" in str(row[1]).strip().lower():
+            continue
+        dt = parse_date_or_none(row[0])
+        if not dt or dt.year != year:
+            continue
+        m = dt.month
+        tyres[m] += parse_num(row[2]); crumb[m] += parse_num(row[10]); metal[m] += parse_num(row[11])
+    try:
+        srows = book.worksheet("Реализация").get_all_values()[1:]
+    except gspread.WorksheetNotFound:
+        srows = []
+    for row in srows:
+        if len(row) < 8:
+            row = row + [""] * (8 - len(row))
+        dt = parse_date_or_none(row[0])
+        if not dt or dt.year != year:
+            continue
+        m = dt.month
+        v = parse_num(row[6]); rev[m] += v; rev_novat[m] += v - parse_num(row[7])
+    try:
+        jrows = book.worksheet("Расходы").get_all_values()[1:]
+    except gspread.WorksheetNotFound:
+        jrows = []
+    for row in jrows:
+        if len(row) < 4:
+            continue
+        s = parse_num(row[1])
+        if not s:
+            continue
+        dt = parse_date_or_none(row[0])
+        if not dt or dt.year != year:
+            continue
+        cat = str(row[3]).strip()
+        cat_sums.setdefault(cat, {})
+        cat_sums[cat][dt.month] = cat_sums[cat].get(dt.month, 0) + s
+
+    prodcats = EXPENSE_GROUPS["Производство"]
+    admcats = EXPENSE_GROUPS["Администрация"]
+    def cs(c, m):
+        return cat_sums.get(c, {}).get(m, 0)
+    def prodc(m):
+        return sum(cs(c, m) for c in prodcats)
+    def admc(m):
+        return sum(cs(c, m) for c in admcats)
+    def full(m):
+        return prodc(m) + admc(m)
+    months = ["Янв", "Фев", "Мар", "Апр", "Май", "Июн", "Июл", "Авг", "Сен", "Окт", "Ноя", "Дек"]
+    def vals(fn):
+        return [round(fn(m)) for m in range(1, 13)]
+    data = [["Показатель"] + months]
+    data.append(["ПРОИЗВОДСТВО, кг"] + [""] * 12)
+    data.append(["Переработано шин"] + vals(lambda m: tyres[m]))
+    data.append(["Произведено крошки"] + vals(lambda m: crumb[m]))
+    data.append(["Металлокорд"] + vals(lambda m: metal[m]))
+    data.append(["Выход крошки, %"] + [round(crumb[m] / tyres[m] * 100, 1) if tyres[m] else 0 for m in range(1, 13)])
+    data.append(["ПРОИЗВОДСТВЕННАЯ СЕБЕСТОИМОСТЬ"] + [""] * 12)
+    for c in prodcats:
+        data.append([c] + vals(lambda m, c=c: cs(c, m)))
+    data.append(["ИТОГО производственная"] + vals(prodc))
+    data.append(["АДМИНИСТРАТИВНЫЕ РАСХОДЫ"] + [""] * 12)
+    for c in admcats:
+        data.append([c] + vals(lambda m, c=c: cs(c, m)))
+    data.append(["ИТОГО административные"] + vals(admc))
+    data.append(["ПОЛНАЯ СЕБЕСТОИМОСТЬ"] + vals(full))
+    data.append(["СЕБЕСТОИМОСТЬ 1 кг, тенге"] + [""] * 12)
+    data.append(["Производственная 1 кг"] + [round(prodc(m) / crumb[m], 2) if crumb[m] else 0 for m in range(1, 13)])
+    data.append(["Полная 1 кг"] + [round(full(m) / crumb[m], 2) if crumb[m] else 0 for m in range(1, 13)])
+    data.append(["ВЫРУЧКА И ПРИБЫЛЬ"] + [""] * 12)
+    data.append(["Выручка с НДС"] + vals(lambda m: rev[m]))
+    data.append(["Выручка без НДС"] + vals(lambda m: rev_novat[m]))
+    data.append(["Прибыль (без НДС − полная себест.)"] + vals(lambda m: rev_novat[m] - full(m)))
+    title = "Себестоимость (авто)"
+    try:
+        ws = book.worksheet(title); ws.clear()
+    except gspread.WorksheetNotFound:
+        ws = book.add_worksheet(title=title, rows=45, cols=14)
+    ws.update(range_name="A1", values=data, value_input_option="USER_ENTERED")
+    return title
+
+
 async def cmd_svod(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Собрать/обновить лист «Свод расходов». Только для разрешённых."""
     if not is_allowed(update):
@@ -1469,12 +1567,14 @@ async def cmd_svod(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📊 Собираю «Свод расходов»...")
     try:
         title, year = await asyncio.to_thread(_build_svod)
+        title2 = await asyncio.to_thread(_build_sebes)
     except Exception as e:
         logger.error(f"svod error: {e}")
         await update.message.reply_text(f"❌ Ошибка при сборке свода: {e}")
         return
     await update.message.reply_text(
-        f"✅ Лист «{title}» готов (год {year}). Категории × месяцы, суммы тянутся из журнала «Расходы» и обновляются сами."
+        f"✅ Готово (год {year}): листы «{title}» и «{title2}». "
+        f"«Свод расходов» — расходы по категориям; «Себестоимость (авто)» — производство, расходы, полная себестоимость, выручка, прибыль и себестоимость 1 кг по месяцам."
     )
 
 
