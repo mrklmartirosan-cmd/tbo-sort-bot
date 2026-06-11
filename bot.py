@@ -723,7 +723,8 @@ async def manual_sale_paytype(update: Update, context: ContextTypes.DEFAULT_TYPE
         return S_PAYTYPE
     context.user_data["sale"]["тип_расчета"] = pay
     if pay == "Безналичный":
-        kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"]], resize_keyboard=True, one_time_keyboard=True)
+        kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["⬅️ Назад", "❌ Отмена"]],
+                                 resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text("🏦 На какой банк придёт оплата?", reply_markup=kb)
         return S_BANK
     await update.message.reply_text(
@@ -736,6 +737,10 @@ async def manual_sale_paytype(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def manual_sale_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Банк поступления при безнал-продаже (для финотчёта)."""
     val = update.message.text.strip().lower()
+    if "назад" in val:
+        kb = ReplyKeyboardMarkup([["Безналичный", "Наличный"]], resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text("💳 Тип расчёта? (Безналичный / Наличный)", reply_markup=kb)
+        return S_PAYTYPE
     if "евраз" in val:
         bank = "Евразийский"
     elif "бцк" in val or "bcc" in val:
@@ -907,7 +912,8 @@ async def photo_sale_paytype(update: Update, context: ContextTypes.DEFAULT_TYPE)
     data = context.user_data.get("pending_sale", {})
     data["тип_расчета"] = pay
     if pay == "Безналичный":
-        kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"]], resize_keyboard=True, one_time_keyboard=True)
+        kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["⬅️ Назад", "❌ Отмена"]],
+                                 resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text("🏦 На какой банк придёт оплата?", reply_markup=kb)
         return PHOTO_SALE_BANK
     await _save_sale_from_photo(update, data)
@@ -919,6 +925,10 @@ async def photo_sale_paytype(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def photo_sale_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Доспрос банка после фото-реализации (безнал) — для финотчёта."""
     val = update.message.text.strip().lower()
+    if "назад" in val:
+        kb = ReplyKeyboardMarkup([["Безналичный", "Наличный"]], resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text("💳 Тип расчёта? (Безналичный / Наличный)", reply_markup=kb)
+        return PHOTO_SALE_PAY
     if "евраз" in val:
         bank = "Евразийский"
     elif "бцк" in val or "bcc" in val:
@@ -1528,7 +1538,7 @@ async def manual_exp_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Выбери кнопкой: Производство, Администрация или Капзатраты.")
         return E_GROUP
     context.user_data["exp"]["группа"] = grp
-    kb = ReplyKeyboardMarkup([[c] for c in EXPENSE_GROUPS[grp]] + [["❌ Отмена"]],
+    kb = ReplyKeyboardMarkup([[c] for c in EXPENSE_GROUPS[grp]] + [["⬅️ Назад", "❌ Отмена"]],
                              resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text("🏷 Категория?", reply_markup=kb)
     return E_CATEGORY
@@ -1582,10 +1592,39 @@ async def manual_exp_contragent(update: Update, context: ContextTypes.DEFAULT_TY
     return E_NOTE
 
 
+async def _ask_note(update, context):
+    """Шаг «за что платим». Если с фото распознано назначение — предлагаем оставить его."""
+    rec = context.user_data["exp"].get("примечание", "")
+    if rec:
+        kb = ReplyKeyboardMarkup([["✅ Оставить как есть"], ["⬅️ Назад", "❌ Отмена"]],
+                                 resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text(
+            f"📝 За что платим? Распознал с документа: «{rec}»\n"
+            "Нажми «✅ Оставить как есть» или напиши своё (или «-», если не нужно).",
+            reply_markup=kb)
+    else:
+        kb = ReplyKeyboardMarkup([["⬅️ Назад", "❌ Отмена"]],
+                                 resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text(
+            "📝 За что платим? Напиши примечание (или «-», если не нужно).", reply_markup=kb)
+    return E_NOTE
+
+
 async def manual_exp_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
-    context.user_data["exp"]["примечание"] = "" if t in ("-", "—") else t
-    kb = ReplyKeyboardMarkup([["✅ Да, сохранить", "❌ Отмена"]],
+    low = t.lower()
+    if "назад" in low:
+        if context.user_data["exp"].get("_photo"):
+            grp = context.user_data["exp"].get("группа", "")
+            kb = ReplyKeyboardMarkup([[c] for c in EXPENSE_GROUPS.get(grp, [])] + [["⬅️ Назад", "❌ Отмена"]],
+                                     resize_keyboard=True, one_time_keyboard=True)
+            await update.message.reply_text("🏷 Категория?", reply_markup=kb)
+            return E_CATEGORY
+        await update.message.reply_text("🏢 Контрагент (кому платим)? Или «-», если не нужно.")
+        return E_CONTRAGENT
+    if "оставить" not in low:
+        context.user_data["exp"]["примечание"] = "" if t in ("-", "—") else t
+    kb = ReplyKeyboardMarkup([["✅ Да, сохранить"], ["⬅️ Назад", "❌ Отмена"]],
                              resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text(_exp_summary(context.user_data["exp"], saved=False),
                                     reply_markup=kb, parse_mode="Markdown")
@@ -1594,6 +1633,8 @@ async def manual_exp_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def manual_exp_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ans = update.message.text.strip().lower()
+    if "назад" in ans:
+        return await _ask_note(update, context)
     if "да" in ans or "сохран" in ans:
         d = context.user_data["exp"]
         save_expense(d)
