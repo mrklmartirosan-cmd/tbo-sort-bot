@@ -830,6 +830,22 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# «Спасательный круг»: кнопки главного меню (и «❌ Отмена») срабатывают ВСЕГДА,
+# даже посреди незаконченного ввода — сбрасывают его, чтобы бот не залипал.
+MENU_ESCAPE_RE = r"^(📸 Производство|📄 Реализация|✍️ Ввод производства|✍️ Ввод реализации|💸 Ввод расхода|❌ Отмена)$"
+
+
+async def conv_menu_escape(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    for k in ("prod", "sale", "exp", "pending_prod", "pending_sale", "pending_photo"):
+        context.user_data.pop(k, None)
+    if "Отмена" in update.message.text:
+        await update.message.reply_text("❌ Отменено, ничего не сохранено.")
+    else:
+        await update.message.reply_text(
+            "⏹ Прошлый незаконченный ввод отменён. Нажми нужную кнопку ещё раз.")
+    return ConversationHandler.END
+
+
 # ---------- Фото и прочий текст ----------
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1408,7 +1424,7 @@ async def _supplier_resolve(update, context, name):
 async def _supplier_done(update, context):
     """Дальше после поставщика: фото → группа, ручной → примечание."""
     if context.user_data.get("exp", {}).get("_photo"):
-        kb = ReplyKeyboardMarkup([["Производство"], ["Администрация"], ["Капзатраты"]],
+        kb = ReplyKeyboardMarkup([["Производство"], ["Администрация"], ["Капзатраты"], ["❌ Отмена"]],
                                  resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text("Выбери группу расхода:", reply_markup=kb)
         return E_GROUP
@@ -1482,7 +1498,7 @@ async def manual_exp_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Введи сумму числом, например 150000.")
         return E_AMOUNT
     context.user_data["exp"]["сумма"] = amt
-    kb = ReplyKeyboardMarkup([["Производство"], ["Администрация"], ["Капзатраты"]],
+    kb = ReplyKeyboardMarkup([["Производство"], ["Администрация"], ["Капзатраты"], ["❌ Отмена"]],
                              resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text("📂 Группа расхода?", reply_markup=kb)
     return E_GROUP
@@ -1494,7 +1510,7 @@ async def manual_exp_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Выбери кнопкой: Производство, Администрация или Капзатраты.")
         return E_GROUP
     context.user_data["exp"]["группа"] = grp
-    kb = ReplyKeyboardMarkup([[c] for c in EXPENSE_GROUPS[grp]],
+    kb = ReplyKeyboardMarkup([[c] for c in EXPENSE_GROUPS[grp]] + [["❌ Отмена"]],
                              resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text("🏷 Категория?", reply_markup=kb)
     return E_CATEGORY
@@ -1504,7 +1520,7 @@ async def manual_exp_category(update: Update, context: ContextTypes.DEFAULT_TYPE
     cat = update.message.text.strip()
     grp = context.user_data["exp"].get("группа", "")
     if cat not in EXPENSE_GROUPS.get(grp, []):
-        await update.message.reply_text("⚠️ Выбери категорию кнопкой из списка.")
+        await update.message.reply_text("⚠️ Выбери категорию кнопкой из списка. Или нажми ❌ Отмена.")
         return E_CATEGORY
     context.user_data["exp"]["категория"] = cat
     if context.user_data["exp"].get("источник"):
@@ -1513,7 +1529,7 @@ async def manual_exp_category(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(_exp_summary(context.user_data["exp"], saved=False),
                                         reply_markup=kb, parse_mode="Markdown")
         return E_CONFIRM
-    kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["Касса 1", "Касса 2"], ["Неденежный"]],
+    kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["Касса 1", "Касса 2"], ["Неденежный"], ["❌ Отмена"]],
                              resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text("🏦 Источник (откуда оплата)?", reply_markup=kb)
     return E_SOURCE
@@ -1616,7 +1632,7 @@ async def manual_exp_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nxt = await _supplier_resolve(update, context, context.user_data["exp"].get("контрагент", ""))
     if nxt is not None:
         return nxt
-    kb = ReplyKeyboardMarkup([["Производство"], ["Администрация"], ["Капзатраты"]],
+    kb = ReplyKeyboardMarkup([["Производство"], ["Администрация"], ["Капзатраты"], ["❌ Отмена"]],
                              resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text("Выбери группу расхода:", reply_markup=kb)
     return E_GROUP
@@ -2290,6 +2306,13 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
+
+    # «Спасательный круг»: в каждом шаге каждого диалога кнопки меню и «❌ Отмена»
+    # обрабатываются первыми — незаконченный ввод сбрасывается, бот не залипает.
+    _escape = MessageHandler(filters.Regex(MENU_ESCAPE_RE), conv_menu_escape)
+    for _conv in (prod_conv, sale_conv, exp_conv, photo_conv):
+        for _handlers in _conv.states.values():
+            _handlers.insert(0, _escape)
 
     app.add_handler(prod_conv)
     app.add_handler(sale_conv)
