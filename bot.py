@@ -1256,7 +1256,7 @@ async def manual_exp_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Нет доступа.")
         return ConversationHandler.END
     context.user_data["exp"] = {}
-    await update.message.reply_text("📅 Дата расхода? (дд.мм.гггг или «сегодня»)")
+    await update.message.reply_text("💸 Внесём расход. Пришли ФОТО счёта/чека — распознаю сам, или введи дату вручную (дд.мм.гггг или «сегодня»).")
     return E_DATE
 
 
@@ -1317,6 +1317,12 @@ async def manual_exp_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Выбери источник кнопкой.")
         return E_SOURCE
     context.user_data["exp"]["источник"] = src
+    if context.user_data["exp"].get("_photo"):
+        kb = ReplyKeyboardMarkup([["✅ Да, сохранить", "❌ Отмена"]],
+                                 resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text(_exp_summary(context.user_data["exp"], saved=False),
+                                        reply_markup=kb, parse_mode="Markdown")
+        return E_CONFIRM
     await update.message.reply_text("🏢 Контрагент (кому платим)? Или «-», если не нужно.")
     return E_CONTRAGENT
 
@@ -1352,6 +1358,48 @@ async def manual_exp_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
     await update.message.reply_text("Нажми «✅ Да, сохранить» или «❌ Отмена».")
     return E_CONFIRM
+
+
+async def recognize_expense(image_bytes: bytes):
+    """Распознаёт расходный документ (счёт/чек/накладную на покупку)."""
+    image_b64 = base64.b64encode(image_bytes).decode()
+    prompt = (
+        "Это фото счёта, чека или накладной на РАСХОД (компания оплачивает товар или услугу).\n"
+        "Верни ТОЛЬКО JSON без markdown:\n"
+        '{"дата":"дд.мм.гггг","контрагент":"кому платим (поставщик/исполнитель)","сумма":0}\n'
+        "Сумма — итог к оплате (с НДС, если указан). Если что-то не читается — 0 или пусто."
+    )
+    return await call_claude(image_b64, prompt)
+
+
+async def manual_exp_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Фото счёта/чека внутри «Ввод расхода»: распознаём сумму/контрагента/дату."""
+    await update.message.reply_text("📸 Получил фото, распознаю расход...")
+    try:
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        image_bytes = bytes(await file.download_as_bytearray())
+        data = await recognize_expense(image_bytes)
+        logger.info(f"Expense photo data: {data}")
+    except Exception as e:
+        logger.error(f"manual_exp_photo error: {e}")
+        await update.message.reply_text("❌ Не смог распознать фото. Введи дату вручную (дд.мм.гггг) или пришли фото чётче.")
+        return E_DATE
+    dt = parse_date_or_none(data.get("дата", ""))
+    context.user_data["exp"] = {
+        "_photo": True,
+        "дата": date_to_str(dt) if dt else datetime.now().strftime("%d.%m.%Y"),
+        "сумма": parse_num(data.get("сумма", 0)),
+        "контрагент": str(data.get("контрагент", "")).strip(),
+    }
+    d = context.user_data["exp"]
+    kb = ReplyKeyboardMarkup([["Производство"], ["Администрация"], ["Капзатраты"]],
+                             resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text(
+        f"💸 Распознал:\n💵 Сумма: {d['сумма']} тнг\n🏢 Контрагент: {d['контрагент'] or '—'}\n📅 Дата: {d['дата']}\n\nВыбери группу расхода:",
+        reply_markup=kb,
+    )
+    return E_GROUP
 
 
 def main():
@@ -1411,7 +1459,7 @@ def main():
     exp_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^💸 Ввод расхода$"), manual_exp_start)],
         states={
-            E_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_date)],
+            E_DATE: [MessageHandler(filters.PHOTO, manual_exp_photo), MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_date)],
             E_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_amount)],
             E_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_group)],
             E_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_category)],
