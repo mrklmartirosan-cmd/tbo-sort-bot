@@ -935,13 +935,16 @@ async def photo_sale_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def detect_doc_type(image_bytes: bytes):
-    """Определяет по фото: накладная-реализация или отчёт производства."""
+    """Определяет по фото: накладная-реализация, отчёт производства или расходный документ."""
     image_b64 = base64.b64encode(image_bytes).decode()
     prompt = (
-        "Определи тип документа на фото. Это одно из двух:\n"
-        "- НАКЛАДНАЯ на отпуск/реализацию (есть покупатель, цены, суммы, НДС) — это продажа;\n"
-        "- ОТЧЁТ ПРОИЗВОДСТВА крошки (смена, оператор, вес шин, фракции в кг, мешки).\n"
-        'Верни ТОЛЬКО JSON: {"тип":"реализация"} или {"тип":"производство"}.'
+        "Определи тип документа на фото. Это одно из трёх:\n"
+        "- НАКЛАДНАЯ на отпуск/реализацию: компания ПРОДАЁТ резиновую крошку — есть покупатель, "
+        "фракции крошки, цены, суммы, НДС;\n"
+        "- ОТЧЁТ ПРОИЗВОДСТВА крошки: смена, оператор, вес шин, фракции в кг, мешки;\n"
+        "- РАСХОДНЫЙ ДОКУМЕНТ: платёжное поручение, счёт на оплату, чек, квитанция — компания "
+        "ПЛАТИТ поставщику. Если плательщик — ТОО «Еділ и компания», это расход.\n"
+        'Верни ТОЛЬКО JSON: {"тип":"реализация"} или {"тип":"производство"} или {"тип":"расход"}.'
     )
     try:
         res = await call_claude(image_b64, prompt)
@@ -949,6 +952,8 @@ async def detect_doc_type(image_bytes: bytes):
     except Exception as e:
         logger.error(f"detect_doc_type error: {e}")
         t = ""
+    if "расход" in t:
+        return "expense"
     return "sale" if "реализ" in t else "production"
 
 
@@ -964,11 +969,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image_bytes = bytes(await file.download_as_bytearray())
         doc_type = await detect_doc_type(image_bytes)
         context.user_data["pending_photo"] = {"file_id": photo.file_id, "type": doc_type}
-        if doc_type == "sale":
-            label, other = "📄 РЕАЛИЗАЦИЯ (накладная)", "🔁 Нет, это производство"
-        else:
-            label, other = "📸 ПРОИЗВОДСТВО (отчёт)", "🔁 Нет, это реализация"
-        kb = ReplyKeyboardMarkup([["✅ Да, верно", other]],
+        labels = {"sale": "📄 РЕАЛИЗАЦИЯ (накладная)",
+                  "production": "📸 ПРОИЗВОДСТВО (отчёт)",
+                  "expense": "💸 РАСХОД (платёжка / счёт / чек)"}
+        others = {"sale": ["🔁 Это производство", "🔁 Это расход"],
+                  "production": ["🔁 Это реализация", "🔁 Это расход"],
+                  "expense": ["🔁 Это реализация", "🔁 Это производство"]}
+        label = labels[doc_type]
+        kb = ReplyKeyboardMarkup([["✅ Да, верно"], others[doc_type], ["❌ Отмена"]],
                                  resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text(
             f"Определил: {label}\n\nВерно? Подтверди — распознаю и сохраню.",
@@ -990,10 +998,14 @@ async def photo_type_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
     if "да" in ans or "верно" in ans:
         photo_type = pending["type"]
-    elif "нет" in ans or "производ" in ans or "реализ" in ans:
-        photo_type = "production" if pending["type"] == "sale" else "sale"
+    elif "расход" in ans:
+        photo_type = "expense"
+    elif "производ" in ans:
+        photo_type = "production"
+    elif "реализ" in ans:
+        photo_type = "sale"
     else:
-        await update.message.reply_text("Нажми «✅ Да, верно» или «🔁 Нет…».")
+        await update.message.reply_text("Нажми «✅ Да, верно», «🔁 Это …» или «❌ Отмена».")
         return PHOTO_TYPE_CONFIRM
     context.user_data.pop("pending_photo", None)
     await update.message.reply_text("🔎 Принято, распознаю данные...")
@@ -1010,6 +1022,12 @@ async def photo_type_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def _dispatch_photo(update, context, photo_type, image_bytes):
     """Распознаёт и сохраняет фото по подтверждённому типу."""
     try:
+        if photo_type == "expense":
+            await update.message.reply_text("💸 Распознаю расходный документ...")
+            data = await recognize_expense(image_bytes)
+            logger.info(f"Expense photo data: {data}")
+            return await _exp_from_photo_data(update, context, data)
+
         if photo_type == "sale":
             data = await recognize_sale(image_bytes)
             logger.info(f"Sale data: {data}")
@@ -1518,18 +1536,19 @@ async def manual_exp_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def manual_exp_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cat = update.message.text.strip()
+    if "назад" in cat.lower():
+        kb = ReplyKeyboardMarkup([["Производство"], ["Администрация"], ["Капзатраты"], ["❌ Отмена"]],
+                                 resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text("📂 Группа расхода?", reply_markup=kb)
+        return E_GROUP
     grp = context.user_data["exp"].get("группа", "")
     if cat not in EXPENSE_GROUPS.get(grp, []):
-        await update.message.reply_text("⚠️ Выбери категорию кнопкой из списка. Или нажми ❌ Отмена.")
+        await update.message.reply_text("⚠️ Выбери категорию кнопкой из списка. Или ⬅️ Назад / ❌ Отмена.")
         return E_CATEGORY
     context.user_data["exp"]["категория"] = cat
     if context.user_data["exp"].get("источник"):
-        kb = ReplyKeyboardMarkup([["✅ Да, сохранить", "❌ Отмена"]],
-                                 resize_keyboard=True, one_time_keyboard=True)
-        await update.message.reply_text(_exp_summary(context.user_data["exp"], saved=False),
-                                        reply_markup=kb, parse_mode="Markdown")
-        return E_CONFIRM
-    kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["Касса 1", "Касса 2"], ["Неденежный"], ["❌ Отмена"]],
+        return await _ask_note(update, context)
+    kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["Касса 1", "Касса 2"], ["Неденежный"], ["⬅️ Назад", "❌ Отмена"]],
                              resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text("🏦 Источник (откуда оплата)?", reply_markup=kb)
     return E_SOURCE
@@ -1537,16 +1556,18 @@ async def manual_exp_category(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def manual_exp_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
     src = update.message.text.strip()
+    if "назад" in src.lower():
+        grp = context.user_data["exp"].get("группа", "")
+        kb = ReplyKeyboardMarkup([[c] for c in EXPENSE_GROUPS.get(grp, [])] + [["⬅️ Назад", "❌ Отмена"]],
+                                 resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text("🏷 Категория?", reply_markup=kb)
+        return E_CATEGORY
     if src not in EXPENSE_SOURCES:
-        await update.message.reply_text("⚠️ Выбери источник кнопкой.")
+        await update.message.reply_text("⚠️ Выбери источник кнопкой. Или ⬅️ Назад / ❌ Отмена.")
         return E_SOURCE
     context.user_data["exp"]["источник"] = src
     if context.user_data["exp"].get("_photo"):
-        kb = ReplyKeyboardMarkup([["✅ Да, сохранить", "❌ Отмена"]],
-                                 resize_keyboard=True, one_time_keyboard=True)
-        await update.message.reply_text(_exp_summary(context.user_data["exp"], saved=False),
-                                        reply_markup=kb, parse_mode="Markdown")
-        return E_CONFIRM
+        return await _ask_note(update, context)
     await update.message.reply_text("🏢 Контрагент (кому платим)? Или «-», если не нужно.")
     return E_CONTRAGENT
 
@@ -1594,8 +1615,11 @@ async def recognize_expense(image_bytes: bytes):
     prompt = (
         "Это фото счёта, чека, платёжного поручения или накладной на РАСХОД (компания оплачивает товар или услугу).\n"
         "Верни ТОЛЬКО JSON без markdown:\n"
-        '{"дата":"дд.мм.гггг","контрагент":"кому платим (поставщик/исполнитель)","сумма":0,"банк":"банк плательщика, если виден"}\n'
-        "Сумма — итог к оплате. Контрагент — ПОЛУЧАТЕЛЬ платежа. Банк — банк ПЛАТЕЛЬЩИКА (наш счёт, откуда деньги), если виден. Если что-то не читается — 0 или пусто."
+        '{"дата":"дд.мм.гггг","контрагент":"кому платим (поставщик/исполнитель)","сумма":0,'
+        '"банк":"банк плательщика, если виден","назначение":"за что платим — назначение платежа '
+        'или наименование товара/услуги, коротко своими словами"}\n'
+        "Сумма — итог к оплате. Контрагент — ПОЛУЧАТЕЛЬ платежа. Банк — банк ПЛАТЕЛЬЩИКА (наш счёт, откуда деньги), если виден. "
+        "Назначение — короткая суть (например «электроэнергия за май», «запчасти к станку»). Если что-то не читается — 0 или пусто."
     )
     return await call_claude(image_b64, prompt)
 
@@ -1613,12 +1637,19 @@ async def manual_exp_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"manual_exp_photo error: {e}")
         await update.message.reply_text("❌ Не смог распознать фото. Введи дату вручную (дд.мм.гггг) или пришли фото чётче.")
         return E_DATE
+    return await _exp_from_photo_data(update, context, data)
+
+
+async def _exp_from_photo_data(update, context, data):
+    """Заполняет черновик расхода из распознанного фото и ведёт дальше по шагам.
+    Используется и внутри «💸 Ввод расхода», и когда фото-расход пришёл без старта."""
     dt = parse_date_or_none(data.get("дата", ""))
     context.user_data["exp"] = {
         "_photo": True,
         "дата": date_to_str(dt) if dt else datetime.now().strftime("%d.%m.%Y"),
         "сумма": parse_num(data.get("сумма", 0)),
         "контрагент": str(data.get("контрагент", "")).strip(),
+        "примечание": str(data.get("назначение", "")).strip()[:120],
     }
     bank_raw = str(data.get("банк", "")).lower()
     if "евраз" in bank_raw:
@@ -2125,20 +2156,24 @@ def _fill_fin(month):
         items = sorted(cashless.get(gname, {}).items(),
                        key=lambda kv: -(kv[1]["Евразийский"] + kv[1]["БЦК"]))
         rng = _fin_leaf_range(grid, gi)
-        if rng is None:
-            # группа без листьев (например ГСМ): пишем суммы прямо в строку группы
-            te = sum(v["Евразийский"] for _, v in items)
-            tb = sum(v["БЦК"] for _, v in items)
-            ws.batch_update([{"range": f"B{gi + 1}", "values": [[round(te, 2)]]},
-                             {"range": f"C{gi + 1}", "values": [[round(tb, 2)]]}],
+        if rng is None and not items:
+            # строка-группа без подстрок и без данных — просто нули
+            ws.batch_update([{"range": f"B{gi + 1}", "values": [[0]]},
+                             {"range": f"C{gi + 1}", "values": [[0]]}],
                             value_input_option="USER_ENTERED")
             continue
-        r1, r2 = rng
-        need = max(len(items), 1)
-        ins = need - (r2 - r1 + 1)
-        if ins > 0:
-            _fin_insert_rows(book, ws, r1, ins)
-            r2 += ins
+        if rng is None:
+            # строка-группа без подстрок (как ГСМ): превращаем в группу с контрагентами,
+            # чтобы было видно, кому платили — как в «Прочих расходах»
+            _fin_insert_rows(book, ws, gi + 1, len(items))
+            r1, r2 = gi + 2, gi + 1 + len(items)
+        else:
+            r1, r2 = rng
+            need = max(len(items), 1)
+            ins = need - (r2 - r1 + 1)
+            if ins > 0:
+                _fin_insert_rows(book, ws, r1, ins)
+                r2 += ins
         data = []
         for k in range(r2 - r1 + 1):
             r = r1 + k
@@ -2188,7 +2223,235 @@ async def cmd_fin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"❌ Ошибка: {e}. Проверь, что файл финотчёта открыт боту на «Редактор».")
         return
+    try:
+        await asyncio.to_thread(_fill_reports, month)
+        summary += "\n\n📈 «Выводы», «Графики» и «Анализ» обновлены по " + RU_MONTHS_FULL[month] + "."
+    except Exception as e:
+        logger.error(f"reports error: {e}")
+        summary += f"\n\n⚠️ Сводные листы не обновились: {e}"
     await update.message.reply_text(summary)
+
+
+# ---------- сводные листы финотчёта: «Выводы», «Графики», «Анализ и выводы» ----------
+
+VYV_SHEET = "Выводы (5 мес)"   # имя листа НЕ меняем — на него могут быть ссылки
+GRAF_SHEET = "Графики"
+ANAL_SHEET = "Анализ и выводы"
+
+# строки «Выводов» -> строка на вкладке месяца: (метка в «Выводах», метка месяца, секция)
+# секции: 0 = безнал-поступления, 1 = безнал-расход, 2 = наличные и итоги
+VYV_MAP = [
+    ("erg", "erg", 0),
+    ("возвраты", "возвраты", 0),
+    ("вознаграждение по депозиту", "вознаграждение по депозиту", 0),
+    ("взнос наличными", "взнос наличными", 0),
+    ("итого безналичные поступления", "итого безналичные поступления", 0),
+    ("переводы между", "переводы между", 0),
+    ("внутренний оборот", "внутренний оборот", 0),
+    ("итого безнал. поступления", "итого безнал. поступления", 0),
+    ("основные средства", "основные средства", 1),
+    ("материалы", "материалы", 1),
+    ("гсм", "гсм", 1),
+    ("фот", "фот", 1),
+    ("налоги", "налоги", 1),
+    ("транспортные услуги", "транспортные услуги", 1),
+    ("лизинг", "ао «фонд", 1),
+    ("прочие расходы", "прочие расходы", 1),
+    ("банк", "банк", 1),
+    ("снятие наличных", "снятие наличных", 1),
+    ("итого расход без вн.оборота", "итого расход без вн.оборота", 1),
+    ("внутренний оборот", "внутренний оборот", 1),
+    ("итого безнал. расход", "итого безналичный расход", 1),
+    ("итого наличные поступления", "итого наличные поступления", 2),
+    ("всего наличный расход", "всего наличный расход", 2),
+    ("всего поступлений", "всего поступлений", 2),
+    ("всего расходов", "всего расходов", 2),
+]
+
+
+def _mln(v):
+    return f"{v / 1e6:.1f}".replace(".", ",")
+
+
+def _fill_reports(month):
+    """Обновляет «Выводы», «Графики», «Анализ и выводы» по вкладке месяца."""
+    book = _get_client().open_by_key(SEBES_FILE_ID)
+    name = RU_MONTHS_FULL[month]
+    year = datetime.now().year
+    mws = book.worksheet(name)
+    mg = mws.get(value_render_option="FORMULA")
+    mi_rash = _fin_find(mg, "безналичный расход")
+    mi_nalpost = _fin_find(mg, "наличные поступления")
+    if mi_rash is None or mi_nalpost is None:
+        raise RuntimeError("вкладка месяца: не нашёл разделы")
+    msec = {0: (0, mi_rash), 1: (mi_rash, mi_nalpost), 2: (mi_nalpost, len(mg))}
+
+    # ===== «Выводы»: столбец месяца формулами на вкладку месяца =====
+    vyv = book.worksheet(VYV_SHEET)
+    vg = vyv.get(value_render_option="FORMULA")
+    hv0 = _fin_find(vg, "поступления (безнал")
+    hv1 = _fin_find(vg, "расходы (безнал")
+    hv2 = _fin_find(vg, "наличные", (hv1 or 0) + 1)
+    if None in (hv0, hv1, hv2):
+        raise RuntimeError("«Выводы»: не нашёл разделы")
+    vsec = {0: (hv0, hv1), 1: (hv1, hv2), 2: (hv2, len(vg))}
+    col_idx, _ = _ensure_kalk_column(book, vyv, month)
+    col = _col_letter(col_idx)
+    itog = _col_letter(col_idx + 1)
+    n_mon = col_idx - 1  # количество месяцев в сводке
+    ups = []
+    vrows = {}
+    used = set()
+    for v_needle, m_needle, sec in VYV_MAP:
+        a, b = vsec[sec]
+        vi = _fin_find(vg, v_needle, a, b)
+        a2, b2 = msec[sec]
+        mi = _fin_find(mg, m_needle, a2, b2)
+        if vi is None or mi is None:
+            continue
+        key = (v_needle, sec)
+        if key in used:
+            continue
+        used.add(key)
+        vrows[v_needle] = vi + 1
+        ups.append({"range": f"{col}{vi + 1}", "values": [[f"='{name}'!D{mi + 1}"]]})
+        ups.append({"range": f"{itog}{vi + 1}", "values": [[f"=SUM(B{vi + 1}:{col}{vi + 1})"]]})
+    rf = vrows.get("фот")
+    rl = vrows.get("лизинг")
+    ri = vrows.get("итого расход без вн.оборота")
+    for needle, num in (("доля фот", rf), ("доля лизинга", rl)):
+        di = _fin_find(vg, needle)
+        if di is not None and num and ri:
+            ups.append({"range": f"{col}{di + 1}",
+                        "values": [[f"=IFERROR({col}{num}/{col}{ri},0)"]]})
+            ups.append({"range": f"{itog}{di + 1}",
+                        "values": [[f"=IFERROR({itog}{num}/{itog}{ri},0)"]]})
+    ups.append({"range": "A1", "values": [[
+        f'ТОО "Едiл и компания" — сводка и выводы за январь–{name} {year} г. (тенге)']]})
+    ups.append({"range": f"{itog}2", "values": [[f"Итого {n_mon} мес"]]})
+    vyv.batch_update(ups, value_input_option="USER_ENTERED")
+
+    # адреса итоговых строк на вкладке месяца (нужны «Графикам» и «Анализу»)
+    m_post = _fin_find(mg, "всего поступлений") + 1
+    m_rash = _fin_find(mg, "всего расходов") + 1
+    m_oper = _fin_find(mg, "итого расход без вн.оборота", mi_rash) + 1
+
+    # ===== «Графики»: строка месяца + структура расходов =====
+    gws = book.worksheet(GRAF_SHEET)
+    gg = gws.get(value_render_option="FORMULA")
+    months_low = set(RU_MONTHS_FULL.values())
+    first = _fin_find(gg, "январь")
+    if first is None:
+        raise RuntimeError("«Графики»: не нашёл строку «Январь»")
+    last = first
+    for i in range(first, len(gg)):
+        a = _fin_norm(gg[i][0] if gg[i] else "")
+        if a in months_low:
+            last = i
+        elif i > last:
+            break
+    mrow = _fin_find(gg, name, first, last + 1)
+    shift = 0
+    if mrow is None:
+        _fin_insert_rows(book, gws, last + 1, 1)
+        mrow = last + 1
+        shift = 1
+    ups = [
+        {"range": f"A{mrow + 1}", "values": [[name.capitalize()]]},
+        {"range": f"B{mrow + 1}", "values": [[f"='{name}'!D{m_post}"]]},
+        {"range": f"C{mrow + 1}", "values": [[f"='{name}'!D{m_rash}"]]},
+        {"range": f"D{mrow + 1}", "values": [[f"='{name}'!D{m_oper}"]]},
+        {"range": "A1", "values": [[
+            f'ТОО "Едiл и компания" — графики за январь–{name} {year} г.']]},
+    ]
+    pie = [("лизинг", "лизинг"), ("фот", "фот"), ("прочие расходы", "прочие расходы"),
+           ("транспортные", "транспортные услуги"), ("основные средства", "основные средства"),
+           ("материалы", "материалы")]
+    for g_needle, v_needle in pie:
+        gi = _fin_find(gg, g_needle, last + 1)
+        r = vrows.get(v_needle)
+        if gi is not None and r:
+            ups.append({"range": f"B{gi + 1 + shift}",
+                        "values": [[f"='{VYV_SHEET}'!{itog}{r}"]]})
+    gi = _fin_find(gg, "прочее", last + 1)
+    parts = [vrows.get(k) for k in ("налоги", "снятие наличных", "гсм", "банк")]
+    if gi is not None and all(parts):
+        f = "+".join(f"'{VYV_SHEET}'!{itog}{p}" for p in parts)
+        ups.append({"range": f"B{gi + 1 + shift}", "values": [["=" + f]]})
+    hdr = _fin_find(gg, "статья расхода")
+    if hdr is not None:
+        ups.append({"range": f"B{hdr + 1 + shift}", "values": [[f"Сумма за {n_mon} мес"]]})
+    gws.batch_update(ups, value_input_option="USER_ENTERED")
+
+    # ===== «Анализ и выводы»: строка месяца, ИТОГО, максимумы/минимумы, структура =====
+    aws = book.worksheet(ANAL_SHEET)
+    ag = aws.get(value_render_option="FORMULA")
+    afirst = _fin_find(ag, "январь")
+    aitog = _fin_find(ag, "итого", afirst)
+    if afirst is None or aitog is None:
+        raise RuntimeError("«Анализ»: не нашёл таблицу месяцев")
+    arow = _fin_find(ag, name, afirst, aitog)
+    ashift = 0
+    if arow is None:
+        _fin_insert_rows(book, aws, aitog, 1)
+        arow = aitog
+        ashift = 1
+    r1 = arow + 1
+    ti = aitog + ashift + 1
+    ups = [
+        {"range": f"A{r1}", "values": [[name.capitalize()]]},
+        {"range": f"B{r1}", "values": [[f"='{name}'!D{m_post}"]]},
+        {"range": f"C{r1}", "values": [[f"='{name}'!D{m_rash}"]]},
+        {"range": f"D{r1}", "values": [[f"=B{r1}-C{r1}"]]},
+        {"range": f"E{r1}", "values": [[f"='{name}'!D{m_oper}"]]},
+        {"range": "A1", "values": [[
+            f'ТОО "Едiл и компания" — анализ, выводы и рекомендации (январь–{name} {year} г.)']]},
+    ]
+    for cl in "BCDE":
+        ups.append({"range": f"{cl}{ti}", "values": [[f"=SUM({cl}{afirst + 1}:{cl}{ti - 1})"]]})
+    aws.batch_update(ups, value_input_option="USER_ENTERED")
+    # максимумы/минимумы — по уже посчитанным значениям таблицы
+    try:
+        vals = aws.get(f"A{afirst + 1}:C{ti - 1}")
+        rows_data = [(str(r[0]), parse_num(r[1]), parse_num(r[2]))
+                     for r in vals if r and len(r) >= 3 and str(r[0]).strip()]
+        h2 = _fin_find(ag, "2. максимумы")
+        if rows_data and h2 is not None:
+            mx_p = max(rows_data, key=lambda x: x[1]); mn_p = min(rows_data, key=lambda x: x[1])
+            mx_r = max(rows_data, key=lambda x: x[2]); mn_r = min(rows_data, key=lambda x: x[2])
+            t1 = (f"• Поступления: максимум — {mx_p[0].upper()} ({_mln(mx_p[1])} млн), "
+                  f"минимум — {mn_p[0].upper()} ({_mln(mn_p[1])} млн).")
+            t2 = (f"• Расходы: максимум — {mx_r[0].upper()} ({_mln(mx_r[1])} млн), "
+                  f"минимум — {mn_r[0].upper()} ({_mln(mn_r[1])} млн).")
+            aws.batch_update([
+                {"range": f"A{h2 + 2 + ashift}", "values": [[t1]]},
+                {"range": f"A{h2 + 3 + ashift}", "values": [[t2]]},
+            ], value_input_option="USER_ENTERED")
+    except Exception as e:
+        logger.error(f"analiz max/min error: {e}")
+    # структура операционных расходов — из «Выводов» (столбец Итого)
+    try:
+        h4 = _fin_find(ag, "4. структура")
+        if h4 is not None and ri and rf and rl:
+            vv = vyv.get(f"{itog}1:{itog}{max(vrows.values())}")
+            def gv(row):
+                i = row - 1
+                return parse_num(vv[i][0]) if i < len(vv) and vv[i] else 0
+            tot = gv(ri)
+            if tot:
+                pr = vrows.get("прочие расходы")
+                items = [("Лизинг", gv(rl)), ("ФОТ", gv(rf)),
+                         ("Прочие", gv(pr) if pr else 0)]
+                line = "; ".join(
+                    f"{nm} — {v / tot * 100:.1f}".replace(".", ",") + f"% ({_mln(v)} млн)"
+                    for nm, v in items) + "."
+                aws.batch_update([
+                    {"range": f"A{h4 + 1 + ashift}", "values": [[
+                        f"4. СТРУКТУРА ОПЕРАЦИОННЫХ РАСХОДОВ ЗА {n_mon} МЕС ({_mln(tot)} млн)"]]},
+                    {"range": f"A{h4 + 2 + ashift}", "values": [[line]]},
+                ], value_input_option="USER_ENTERED")
+    except Exception as e:
+        logger.error(f"analiz structure error: {e}")
 
 
 # ---------- авто-обновление «Калькуляции» и финотчёта после каждой записи ----------
@@ -2215,6 +2478,10 @@ async def _run_refresh():
                 await asyncio.to_thread(_fill_fin, month)
             except Exception as e:
                 logger.error(f"auto-fin error: {e}")
+            try:
+                await asyncio.to_thread(_fill_reports, month)
+            except Exception as e:
+                logger.error(f"auto-reports error: {e}")
             if not _refresh_again:
                 break
 
@@ -2268,6 +2535,23 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    # Общие шаги ввода расхода — используются и из «💸 Ввод расхода»,
+    # и когда фото расходного документа пришло без старта (через photo_conv).
+    def _exp_states():
+        return {
+            E_DATE: [MessageHandler(filters.PHOTO, manual_exp_photo), MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_date)],
+            E_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_amount)],
+            E_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_group)],
+            E_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_category)],
+            E_SOURCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_source)],
+            E_CONTRAGENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_contragent)],
+            E_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_note)],
+            E_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_confirm)],
+            E_SUP_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, exp_sup_confirm)],
+            E_SUP_NEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, exp_sup_new)],
+            E_SUP_EDIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, exp_sup_edit)],
+        }
+
     # NEW: диалог фото-производства с подтверждением дубля.
     # entry_point — приход фото; если дубль, переходим в PHOTO_PROD_CONFIRM и ждём Да/Нет.
     photo_conv = ConversationHandler(
@@ -2277,6 +2561,7 @@ def main():
             PHOTO_PROD_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_prod_confirm)],
             PHOTO_SALE_PAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_sale_paytype)],
             PHOTO_SALE_BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_sale_bank)],
+            **_exp_states(),  # фото-расход продолжает шаги расхода прямо здесь
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
@@ -2291,19 +2576,7 @@ def main():
     app.add_handler(CommandHandler("fin", cmd_fin))
     exp_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^💸 Ввод расхода$"), manual_exp_start)],
-        states={
-            E_DATE: [MessageHandler(filters.PHOTO, manual_exp_photo), MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_date)],
-            E_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_amount)],
-            E_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_group)],
-            E_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_category)],
-            E_SOURCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_source)],
-            E_CONTRAGENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_contragent)],
-            E_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_note)],
-            E_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_confirm)],
-            E_SUP_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, exp_sup_confirm)],
-            E_SUP_NEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, exp_sup_new)],
-            E_SUP_EDIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, exp_sup_edit)],
-        },
+        states=_exp_states(),
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
