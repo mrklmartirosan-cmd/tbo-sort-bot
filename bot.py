@@ -71,6 +71,7 @@ RU_MONTHS = {
 # NEW: состояние подтверждения дубля при фото-производстве
 # + доспрос нал/безнал после фото-реализации (чтобы продажа попала в отчёт)
 (PHOTO_PROD_CONFIRM, PHOTO_SALE_PAY, PHOTO_TYPE_CONFIRM) = range(21, 24)
+(E_DATE, E_AMOUNT, E_GROUP, E_CATEGORY, E_SOURCE, E_CONTRAGENT, E_NOTE, E_CONFIRM) = range(24, 32)
 
 FRACTIONS = ["0-1", "1-2", "2-4", "4-6", "6-8"]
 
@@ -470,6 +471,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         ["📸 Производство", "📄 Реализация"],
         ["✍️ Ввод производства", "✍️ Ввод реализации"],
+        ["💸 Ввод расхода"],
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text(
@@ -788,6 +790,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("pending_prod", None)
     context.user_data.pop("pending_sale", None)
     context.user_data.pop("pending_photo", None)
+    context.user_data.pop("exp", None)
     await update.message.reply_text("❌ Отменено.")
     return ConversationHandler.END
 
@@ -1185,6 +1188,172 @@ async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ {res}")
 
 
+# ---------- Журнал «Расходы»: ввод расходов компании ----------
+
+SHEET_EXPENSES = "Расходы"
+EXPENSE_HEADERS = ["Дата", "Сумма", "Группа", "Категория", "Нал/Безнал", "Источник", "Контрагент", "Примечание"]
+EXPENSE_GROUPS = {
+    "Производство": [
+        "Материалы и запчасти", "Упаковка (мешки)", "Электроэнергия", "ГСМ",
+        "ФОТ производственный", "Транспорт и логистика", "Лизинг (вознаграждение)",
+        "Амортизация производства",
+    ],
+    "Администрация": [
+        "ФОТ административный", "Налоги", "Услуги банка", "Страхование", "Аудит",
+        "Прочие административные", "Амортизация административная",
+    ],
+    "Капзатраты": [
+        "Основные средства", "Лизинг (основной долг)", "Прочие капзатраты",
+    ],
+}
+EXPENSE_SOURCES = ["Евразийский", "БЦК", "Касса 1", "Касса 2", "Неденежный"]
+
+
+def get_expenses_ws():
+    return get_worksheet(SHEET_EXPENSES, EXPENSE_HEADERS)
+
+
+def _source_to_paytype(src):
+    if src in ("Евразийский", "БЦК"):
+        return "Безналичный"
+    if src in ("Касса 1", "Касса 2"):
+        return "Наличный"
+    return "Неденежный"
+
+
+def save_expense(data):
+    ws = get_expenses_ws()
+    src = data.get("источник", "")
+    row = [
+        data.get("дата", datetime.now().strftime("%d.%m.%Y")),
+        parse_num(data.get("сумма", 0)),
+        data.get("группа", ""),
+        data.get("категория", ""),
+        _source_to_paytype(src),
+        src,
+        data.get("контрагент", ""),
+        data.get("примечание", ""),
+    ]
+    ws.append_row(row, value_input_option="USER_ENTERED")
+
+
+def _exp_summary(d, saved=True):
+    head = "✅ *Расход сохранён!*" if saved else "Проверь расход перед сохранением:"
+    return (
+        f"{head}\n\n"
+        f"📅 Дата: {d.get('дата', '—')}\n"
+        f"💵 Сумма: {d.get('сумма', 0)} тнг\n"
+        f"📂 Группа: {d.get('группа', '—')}\n"
+        f"🏷 Категория: {d.get('категория', '—')}\n"
+        f"🏦 Источник: {d.get('источник', '—')}\n"
+        f"🏢 Контрагент: {d.get('контрагент') or '—'}\n"
+        f"📝 Примечание: {d.get('примечание') or '—'}"
+    )
+
+
+async def manual_exp_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.message.reply_text("⛔ Нет доступа.")
+        return ConversationHandler.END
+    context.user_data["exp"] = {}
+    await update.message.reply_text("📅 Дата расхода? (дд.мм.гггг или «сегодня»)")
+    return E_DATE
+
+
+async def manual_exp_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip().lower()
+    if t in ("сегодня", "today"):
+        context.user_data["exp"]["дата"] = datetime.now().strftime("%d.%m.%Y")
+    else:
+        dt = parse_date_or_none(update.message.text)
+        if dt is None:
+            await update.message.reply_text("⚠️ Не понял дату. Введи в виде 08.06.2026 или «сегодня».")
+            return E_DATE
+        context.user_data["exp"]["дата"] = date_to_str(dt)
+    await update.message.reply_text("💵 Сумма расхода, тенге?")
+    return E_AMOUNT
+
+
+async def manual_exp_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    amt = parse_num(update.message.text)
+    if not amt:
+        await update.message.reply_text("⚠️ Введи сумму числом, например 150000.")
+        return E_AMOUNT
+    context.user_data["exp"]["сумма"] = amt
+    kb = ReplyKeyboardMarkup([["Производство"], ["Администрация"], ["Капзатраты"]],
+                             resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text("📂 Группа расхода?", reply_markup=kb)
+    return E_GROUP
+
+
+async def manual_exp_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    grp = update.message.text.strip()
+    if grp not in EXPENSE_GROUPS:
+        await update.message.reply_text("⚠️ Выбери кнопкой: Производство, Администрация или Капзатраты.")
+        return E_GROUP
+    context.user_data["exp"]["группа"] = grp
+    kb = ReplyKeyboardMarkup([[c] for c in EXPENSE_GROUPS[grp]],
+                             resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text("🏷 Категория?", reply_markup=kb)
+    return E_CATEGORY
+
+
+async def manual_exp_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cat = update.message.text.strip()
+    grp = context.user_data["exp"].get("группа", "")
+    if cat not in EXPENSE_GROUPS.get(grp, []):
+        await update.message.reply_text("⚠️ Выбери категорию кнопкой из списка.")
+        return E_CATEGORY
+    context.user_data["exp"]["категория"] = cat
+    kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["Касса 1", "Касса 2"], ["Неденежный"]],
+                             resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text("🏦 Источник (откуда оплата)?", reply_markup=kb)
+    return E_SOURCE
+
+
+async def manual_exp_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    src = update.message.text.strip()
+    if src not in EXPENSE_SOURCES:
+        await update.message.reply_text("⚠️ Выбери источник кнопкой.")
+        return E_SOURCE
+    context.user_data["exp"]["источник"] = src
+    await update.message.reply_text("🏢 Контрагент (кому платим)? Или «-», если не нужно.")
+    return E_CONTRAGENT
+
+
+async def manual_exp_contragent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    context.user_data["exp"]["контрагент"] = "" if t in ("-", "—") else t
+    await update.message.reply_text("📝 Примечание? Или «-», если нет.")
+    return E_NOTE
+
+
+async def manual_exp_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    context.user_data["exp"]["примечание"] = "" if t in ("-", "—") else t
+    kb = ReplyKeyboardMarkup([["✅ Да, сохранить", "❌ Отмена"]],
+                             resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text(_exp_summary(context.user_data["exp"], saved=False),
+                                    reply_markup=kb, parse_mode="Markdown")
+    return E_CONFIRM
+
+
+async def manual_exp_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ans = update.message.text.strip().lower()
+    if "да" in ans or "сохран" in ans:
+        d = context.user_data["exp"]
+        save_expense(d)
+        await update.message.reply_text(_exp_summary(d, saved=True), parse_mode="Markdown")
+        context.user_data.pop("exp", None)
+        return ConversationHandler.END
+    if "отмена" in ans or "нет" in ans:
+        context.user_data.pop("exp", None)
+        await update.message.reply_text("❌ Отменено, расход не сохранён.")
+        return ConversationHandler.END
+    await update.message.reply_text("Нажми «✅ Да, сохранить» или «❌ Отмена».")
+    return E_CONFIRM
+
+
 def main():
     app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
 
@@ -1239,9 +1408,25 @@ def main():
     app.add_handler(CommandHandler("last", last_records))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("backup", cmd_backup))
+    exp_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^💸 Ввод расхода$"), manual_exp_start)],
+        states={
+            E_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_date)],
+            E_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_amount)],
+            E_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_group)],
+            E_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_category)],
+            E_SOURCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_source)],
+            E_CONTRAGENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_contragent)],
+            E_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_note)],
+            E_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_confirm)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     app.add_handler(prod_conv)
     app.add_handler(sale_conv)
     app.add_handler(photo_conv)  # вместо прямого MessageHandler(filters.PHOTO, ...)
+    app.add_handler(exp_conv)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     if WEBHOOK_URL:
