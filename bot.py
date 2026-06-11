@@ -1164,6 +1164,10 @@ async def _backup_loop(application):
             await do_backup(application.bot)
         except Exception as e:
             logger.error(f"scheduled backup error: {e}")
+        try:
+            await asyncio.to_thread(_build_svod)
+        except Exception as e:
+            logger.error(f"scheduled svod error: {e}")
 
 
 async def _post_init(application):
@@ -1414,30 +1418,45 @@ async def manual_exp_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _build_svod():
-    """Создаёт/обновляет лист «Свод расходов»: категории × месяцы, суммы из журнала «Расходы» формулами."""
+    """Пересобирает лист «Свод расходов»: категории × месяцы, суммы из журнала «Расходы» (готовые числа, не формулы)."""
     book = get_spreadsheet()
+    sums = {}
+    try:
+        jrows = book.worksheet("Расходы").get_all_values()[1:]
+    except gspread.WorksheetNotFound:
+        jrows = []
+    year = datetime.now().year
+    for row in jrows:
+        if len(row) < 4:
+            continue
+        s = parse_num(row[1])
+        if not s:
+            continue
+        dt = parse_date_or_none(row[0])
+        if not dt or dt.year != year:
+            continue
+        cat = str(row[3]).strip()
+        sums.setdefault(cat, {})
+        sums[cat][dt.month] = sums[cat].get(dt.month, 0) + s
     title = "Свод расходов"
     try:
         ws = book.worksheet(title)
         ws.clear()
     except gspread.WorksheetNotFound:
         ws = book.add_worksheet(title=title, rows=60, cols=15)
-    year = datetime.now().year
     months = ["Янв", "Фев", "Мар", "Апр", "Май", "Июн", "Июл", "Авг", "Сен", "Окт", "Ноя", "Дек"]
     data = [["Категория"] + months + ["Итого"]]
     for grp in ("Производство", "Администрация", "Капзатраты"):
         data.append([grp.upper()] + [""] * 13)
         for cat in EXPENSE_GROUPS[grp]:
-            r = len(data) + 1
-            cells = [cat]
+            row_vals = [cat]
+            total = 0
             for mi in range(1, 13):
-                cells.append(
-                    f"=SUMIFS('Расходы'!$B:$B;'Расходы'!$D:$D;$A{r};"
-                    f"'Расходы'!$A:$A;\">=\"&DATE({year};{mi};1);"
-                    f"'Расходы'!$A:$A;\"<=\"&EOMONTH(DATE({year};{mi};1);0))"
-                )
-            cells.append(f"=SUM(B{r}:M{r})")
-            data.append(cells)
+                v = sums.get(cat, {}).get(mi, 0)
+                row_vals.append(round(v))
+                total += v
+            row_vals.append(round(total))
+            data.append(row_vals)
     ws.update(range_name="A1", values=data, value_input_option="USER_ENTERED")
     return title, year
 
