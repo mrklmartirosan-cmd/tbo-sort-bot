@@ -1364,7 +1364,7 @@ async def recognize_expense(image_bytes: bytes):
     """Распознаёт расходный документ (счёт/чек/накладную на покупку)."""
     image_b64 = base64.b64encode(image_bytes).decode()
     prompt = (
-        "Это фото счёта, чека или накладной на РАСХОД (компания оплачивает товар или услугу).\n"
+        "Это фото счёта, чека, платёжного поручения или накладной на РАСХОД (компания оплачивает товар или услугу).\n"
         "Верни ТОЛЬКО JSON без markdown:\n"
         '{"дата":"дд.мм.гггг","контрагент":"кому платим (поставщик/исполнитель)","сумма":0}\n'
         "Сумма — итог к оплате (с НДС, если указан). Если что-то не читается — 0 или пусто."
@@ -1473,8 +1473,8 @@ def main():
 
     app.add_handler(prod_conv)
     app.add_handler(sale_conv)
-    app.add_handler(photo_conv)  # вместо прямого MessageHandler(filters.PHOTO, ...)
     app.add_handler(exp_conv)
+    app.add_handler(photo_conv)  # после exp_conv: фото в режиме «Ввод расхода» ловит exp_conv
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     if WEBHOOK_URL:
