@@ -1716,6 +1716,130 @@ async def cmd_svod(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# --- Запись себестоимости в файл экономиста («Калькуляция себестоимости») ---
+SEBES_FILE_ID = "1ZKYCFVKrb0l-mzYQ0gtiHKOJbTNHd9TcJ9hN9i5RiFk"
+KALK_SHEET = "Калькуляция себестоимости"
+RU_MONTHS_FULL = {1: "январь", 2: "февраль", 3: "март", 4: "апрель", 5: "май", 6: "июнь",
+                  7: "июль", 8: "август", 9: "сентябрь", 10: "октябрь", 11: "ноябрь", 12: "декабрь"}
+# строка «Калькуляции» -> категория журнала (или спец-ключ производства)
+KALK_ROWS = {
+    4: "_шины", 5: "_крошка", 6: "_металл",
+    9: "Материалы и запчасти", 10: "Упаковка (мешки)", 11: "Электроэнергия", 12: "ГСМ",
+    13: "ФОТ производственный", 14: "Транспорт и логистика", 15: "Лизинг (вознаграждение)",
+    16: "Амортизация производства",
+    19: "ФОТ административный", 20: "Услуги банка", 21: "Налоги", 22: "Аудит", 23: "Страхование",
+    24: "Прочие административные", 25: "Амортизация административная",
+    32: "Лизинг (основной долг)", 33: "Основные средства",
+}
+
+
+def _col_letter(n):
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _ensure_kalk_column(book, ws, month):
+    """Находит столбец месяца в «Калькуляции» или создаёт его (перед «Итого», с форматом соседа).
+    Возвращает (col_1based, created)."""
+    target = RU_MONTHS_FULL[month]
+    header = ws.row_values(2)
+    for i, h in enumerate(header, start=1):
+        if target in str(h).strip().lower():
+            return i, False
+    itog_idx = None
+    for i, h in enumerate(header, start=1):
+        if "итог" in str(h).strip().lower():
+            itog_idx = i
+            break
+    if itog_idx is None:
+        itog_idx = len(header) + 1
+    book.batch_update({"requests": [
+        {"insertDimension": {"range": {"sheetId": ws.id, "dimension": "COLUMNS",
+                                       "startIndex": itog_idx - 1, "endIndex": itog_idx},
+                             "inheritFromBefore": True}}
+    ]})
+    ws.update_cell(2, itog_idx, target.capitalize())
+    return itog_idx, True
+
+
+def _fill_kalk(month):
+    """Заполняет (и при необходимости создаёт) столбец месяца в «Калькуляции». Возвращает (col, crumb, created)."""
+    skl = get_spreadsheet()
+    year = datetime.now().year
+    tyres = crumb = metal = 0.0
+    for row in skl.worksheet("Производство").get_all_values()[1:]:
+        if len(row) < 12:
+            row = row + [""] * (12 - len(row))
+        if "начальн" in str(row[1]).strip().lower():
+            continue
+        dt = parse_date_or_none(row[0])
+        if not dt or dt.year != year or dt.month != month:
+            continue
+        tyres += parse_num(row[2]); crumb += parse_num(row[10]); metal += parse_num(row[11])
+    cat = {}
+    try:
+        for row in skl.worksheet("Расходы").get_all_values()[1:]:
+            if len(row) < 4:
+                continue
+            s = parse_num(row[1])
+            if not s:
+                continue
+            dt = parse_date_or_none(row[0])
+            if not dt or dt.year != year or dt.month != month:
+                continue
+            c = str(row[3]).strip()
+            cat[c] = cat.get(c, 0) + s
+    except gspread.WorksheetNotFound:
+        pass
+    book = _get_client().open_by_key(SEBES_FILE_ID)
+    ws = book.worksheet(KALK_SHEET)
+    col_idx, created = _ensure_kalk_column(book, ws, month)
+    col = _col_letter(col_idx)
+    vals = {"_шины": tyres, "_крошка": crumb, "_металл": metal}
+    updates = []
+    for r, key in KALK_ROWS.items():
+        v = vals[key] if key in vals else cat.get(key, 0)
+        updates.append({"range": col + str(r), "values": [[round(v)]]})
+    if created:
+        prod_t = sum(cat.get(k, 0) for k in ["Материалы и запчасти", "Упаковка (мешки)", "Электроэнергия",
+                     "ГСМ", "ФОТ производственный", "Транспорт и логистика", "Лизинг (вознаграждение)",
+                     "Амортизация производства"])
+        adm_t = sum(cat.get(k, 0) for k in ["ФОТ административный", "Услуги банка", "Налоги", "Аудит",
+                    "Страхование", "Прочие административные", "Амортизация административная"])
+        full = prod_t + adm_t
+        kap = cat.get("Лизинг (основной долг)", 0) + cat.get("Основные средства", 0)
+        extra = {7: round(crumb / tyres, 3) if tyres else 0, 17: round(prod_t), 26: round(adm_t),
+                 27: round(full), 29: round(prod_t / crumb, 2) if crumb else 0,
+                 30: round(full / crumb, 2) if crumb else 0, 35: round(kap)}
+        for r, v in extra.items():
+            updates.append({"range": col + str(r), "values": [[v]]})
+    ws.batch_update(updates, value_input_option="USER_ENTERED")
+    return col, crumb, created
+
+
+async def cmd_kalk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Заполнить текущий месяц в «Калькуляции» файла экономиста."""
+    if not is_allowed(update):
+        await update.message.reply_text("⛔ Нет доступа.")
+        return
+    month = datetime.now().month
+    await update.message.reply_text(f"📊 Заполняю «Калькуляцию» за {RU_MONTHS_FULL[month]}...")
+    try:
+        res = await asyncio.to_thread(_fill_kalk, month)
+    except Exception as e:
+        logger.error(f"kalk error: {e}")
+        await update.message.reply_text(f"❌ Ошибка: {e}. Проверь, что файл открыт боту на «Редактор».")
+        return
+    col, crumb, created = res
+    note = " (создал столбец автоматически)" if created else ""
+    await update.message.reply_text(
+        f"✅ Столбец «{RU_MONTHS_FULL[month]}»{note} в «Калькуляции» заполнен: производство + расходы. "
+        f"Произведено крошки: {round(crumb)} кг. Итоги и себестоимость 1 кг посчитаны.")
+
+
 def main():
     app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
 
@@ -1771,6 +1895,7 @@ def main():
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("backup", cmd_backup))
     app.add_handler(CommandHandler("svod", cmd_svod))
+    app.add_handler(CommandHandler("kalk", cmd_kalk))
     exp_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^💸 Ввод расхода$"), manual_exp_start)],
         states={
