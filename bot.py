@@ -1305,6 +1305,12 @@ async def manual_exp_category(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("⚠️ Выбери категорию кнопкой из списка.")
         return E_CATEGORY
     context.user_data["exp"]["категория"] = cat
+    if context.user_data["exp"].get("источник"):
+        kb = ReplyKeyboardMarkup([["✅ Да, сохранить", "❌ Отмена"]],
+                                 resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text(_exp_summary(context.user_data["exp"], saved=False),
+                                        reply_markup=kb, parse_mode="Markdown")
+        return E_CONFIRM
     kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["Касса 1", "Касса 2"], ["Неденежный"]],
                              resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text("🏦 Источник (откуда оплата)?", reply_markup=kb)
@@ -1366,8 +1372,8 @@ async def recognize_expense(image_bytes: bytes):
     prompt = (
         "Это фото счёта, чека, платёжного поручения или накладной на РАСХОД (компания оплачивает товар или услугу).\n"
         "Верни ТОЛЬКО JSON без markdown:\n"
-        '{"дата":"дд.мм.гггг","контрагент":"кому платим (поставщик/исполнитель)","сумма":0}\n'
-        "Сумма — итог к оплате (с НДС, если указан). Если что-то не читается — 0 или пусто."
+        '{"дата":"дд.мм.гггг","контрагент":"кому платим (поставщик/исполнитель)","сумма":0,"банк":"банк плательщика, если виден"}\n'
+        "Сумма — итог к оплате. Контрагент — ПОЛУЧАТЕЛЬ платежа. Банк — банк ПЛАТЕЛЬЩИКА (наш счёт, откуда деньги), если виден. Если что-то не читается — 0 или пусто."
     )
     return await call_claude(image_b64, prompt)
 
@@ -1392,6 +1398,11 @@ async def manual_exp_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "сумма": parse_num(data.get("сумма", 0)),
         "контрагент": str(data.get("контрагент", "")).strip(),
     }
+    bank_raw = str(data.get("банк", "")).lower()
+    if "евраз" in bank_raw:
+        context.user_data["exp"]["источник"] = "Евразийский"
+    elif "центркредит" in bank_raw or "бцк" in bank_raw or "centercredit" in bank_raw:
+        context.user_data["exp"]["источник"] = "БЦК"
     d = context.user_data["exp"]
     kb = ReplyKeyboardMarkup([["Производство"], ["Администрация"], ["Капзатраты"]],
                              resize_keyboard=True, one_time_keyboard=True)
