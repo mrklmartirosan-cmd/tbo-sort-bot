@@ -72,6 +72,8 @@ RU_MONTHS = {
 # + доспрос нал/безнал после фото-реализации (чтобы продажа попала в отчёт)
 (PHOTO_PROD_CONFIRM, PHOTO_SALE_PAY, PHOTO_TYPE_CONFIRM) = range(21, 24)
 (E_DATE, E_AMOUNT, E_GROUP, E_CATEGORY, E_SOURCE, E_CONTRAGENT, E_NOTE, E_CONFIRM, E_SUP_CONFIRM, E_SUP_NEW, E_SUP_EDIT) = range(24, 35)
+# NEW: банк поступления при безнал-продаже (ручной ввод и фото) — для финотчёта
+(S_BANK, PHOTO_SALE_BANK) = range(35, 37)
 
 FRACTIONS = ["0-1", "1-2", "2-4", "4-6", "6-8"]
 
@@ -272,6 +274,15 @@ def save_production(data):
     ws.append_row(row, value_input_option="USER_ENTERED")
 
 
+def _note_with_bank(data):
+    """Примечание продажи + банк поступления (нужно финотчёту; колонки листа не меняем)."""
+    note = data.get("примечание", "")
+    bank = data.get("банк", "")
+    if bank:
+        note = (note + "; " if note else "") + f"банк: {bank}"
+    return note
+
+
 def save_sale(data):
     ws = get_sales_ws()
     qty_kg = parse_num(data.get("количество_кг", 0))
@@ -286,7 +297,7 @@ def save_sale(data):
         parse_num(data.get("цена_за_кг", 0)),
         parse_num(data.get("сумма_с_ндс", 0)),
         parse_num(data.get("сумма_ндс", 0)),
-        data.get("примечание", ""),
+        _note_with_bank(data),
     ]
     ws.append_row(row, value_input_option="USER_ENTERED")
 
@@ -655,6 +666,7 @@ async def manual_prod_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"dup check error (manual): {e}")
 
     save_production(d)
+    schedule_refresh()
     await update.message.reply_text(_prod_summary(d) + dup_note, parse_mode="Markdown")
     context.user_data.pop("prod", None)
     return ConversationHandler.END
@@ -710,6 +722,28 @@ async def manual_sale_paytype(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("⚠️ Выбери: Безналичный или Наличный")
         return S_PAYTYPE
     context.user_data["sale"]["тип_расчета"] = pay
+    if pay == "Безналичный":
+        kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"]], resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text("🏦 На какой банк придёт оплата?", reply_markup=kb)
+        return S_BANK
+    await update.message.reply_text(
+        "📦 Фракция? (например: 2-4)\n_Доступны: 0-1, 1-2, 2-4, 4-6, 6-8_",
+        parse_mode="Markdown"
+    )
+    return S_FRAC
+
+
+async def manual_sale_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Банк поступления при безнал-продаже (для финотчёта)."""
+    val = update.message.text.strip().lower()
+    if "евраз" in val:
+        bank = "Евразийский"
+    elif "бцк" in val or "bcc" in val:
+        bank = "БЦК"
+    else:
+        await update.message.reply_text("⚠️ Выбери: Евразийский или БЦК")
+        return S_BANK
+    context.user_data["sale"]["банк"] = bank
     await update.message.reply_text(
         "📦 Фракция? (например: 2-4)\n_Доступны: 0-1, 1-2, 2-4, 4-6, 6-8_",
         parse_mode="Markdown"
@@ -758,6 +792,7 @@ async def manual_sale_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["sale"]["примечание"] = "" if note in ("-", "—") else note
     d = context.user_data["sale"]
     save_sale(d)
+    schedule_refresh()
 
     report_line = ""
     try:
@@ -816,6 +851,7 @@ async def _save_sale_from_photo(update, data):
     """Сохранение реализации с фото + попытка записи в отчёт (вынесено для чистоты)."""
     data.setdefault("тип_расчета", "")
     save_sale(data)
+    schedule_refresh()
 
     report_line = ""
     try:
@@ -854,6 +890,28 @@ async def photo_sale_paytype(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return PHOTO_SALE_PAY
     data = context.user_data.get("pending_sale", {})
     data["тип_расчета"] = pay
+    if pay == "Безналичный":
+        kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"]], resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text("🏦 На какой банк придёт оплата?", reply_markup=kb)
+        return PHOTO_SALE_BANK
+    await _save_sale_from_photo(update, data)
+    context.user_data.pop("pending_sale", None)
+    context.user_data["photo_type"] = "production"
+    return ConversationHandler.END
+
+
+async def photo_sale_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Доспрос банка после фото-реализации (безнал) — для финотчёта."""
+    val = update.message.text.strip().lower()
+    if "евраз" in val:
+        bank = "Евразийский"
+    elif "бцк" in val or "bcc" in val:
+        bank = "БЦК"
+    else:
+        await update.message.reply_text("⚠️ Выбери: Евразийский или БЦК")
+        return PHOTO_SALE_BANK
+    data = context.user_data.get("pending_sale", {})
+    data["банк"] = bank
     await _save_sale_from_photo(update, data)
     context.user_data.pop("pending_sale", None)
     context.user_data["photo_type"] = "production"
@@ -1021,6 +1079,8 @@ async def _dispatch_photo(update, context, photo_type, image_bytes):
         # Чистые записи сохраняем сразу
         for item in clean:
             save_production(item)
+        if clean:
+            schedule_refresh()
 
         # Если есть подозрение на дубль — спрашиваем по первому, остальные дубли держим в очереди
         if dups:
@@ -1079,6 +1139,7 @@ async def photo_prod_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if "да" in ans:
         for item in dups:
             save_production(item)
+        schedule_refresh()
         await update.message.reply_text(
             f"✅ Добавил, несмотря на совпадение. Записей: {len(dups)}.\n"
             f"Проверь остаток: /ostatok"
@@ -1169,6 +1230,10 @@ async def _backup_loop(application):
             await asyncio.to_thread(_build_sebes)
         except Exception as e:
             logger.error(f"scheduled svod error: {e}")
+        try:
+            await _run_refresh()  # страховочный суточный прогон «Калькуляции» и финотчёта
+        except Exception as e:
+            logger.error(f"scheduled refresh error: {e}")
 
 
 async def _post_init(application):
@@ -1495,6 +1560,7 @@ async def manual_exp_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if "да" in ans or "сохран" in ans:
         d = context.user_data["exp"]
         save_expense(d)
+        schedule_refresh()
         await update.message.reply_text(_exp_summary(d, saved=True), parse_mode="Markdown")
         context.user_data.pop("exp", None)
         return ConversationHandler.END
@@ -1803,19 +1869,20 @@ def _fill_kalk(month):
     for r, key in KALK_ROWS.items():
         v = vals[key] if key in vals else cat.get(key, 0)
         updates.append({"range": col + str(r), "values": [[round(v)]]})
-    if created:
-        prod_t = sum(cat.get(k, 0) for k in ["Материалы и запчасти", "Упаковка (мешки)", "Электроэнергия",
-                     "ГСМ", "ФОТ производственный", "Транспорт и логистика", "Лизинг (вознаграждение)",
-                     "Амортизация производства"])
-        adm_t = sum(cat.get(k, 0) for k in ["ФОТ административный", "Услуги банка", "Налоги", "Аудит",
-                    "Страхование", "Прочие административные", "Амортизация административная"])
-        full = prod_t + adm_t
-        kap = cat.get("Лизинг (основной долг)", 0) + cat.get("Основные средства", 0)
-        extra = {7: round(crumb / tyres, 3) if tyres else 0, 17: round(prod_t), 26: round(adm_t),
-                 27: round(full), 29: round(prod_t / crumb, 2) if crumb else 0,
-                 30: round(full / crumb, 2) if crumb else 0, 35: round(kap)}
-        for r, v in extra.items():
-            updates.append({"range": col + str(r), "values": [[v]]})
+    # итоги и себестоимость пишем при КАЖДОМ запуске (не только при создании столбца),
+    # иначе при авто-обновлении категории обновляются, а итоги отстают
+    prod_t = sum(cat.get(k, 0) for k in ["Материалы и запчасти", "Упаковка (мешки)", "Электроэнергия",
+                 "ГСМ", "ФОТ производственный", "Транспорт и логистика", "Лизинг (вознаграждение)",
+                 "Амортизация производства"])
+    adm_t = sum(cat.get(k, 0) for k in ["ФОТ административный", "Услуги банка", "Налоги", "Аудит",
+                "Страхование", "Прочие административные", "Амортизация административная"])
+    full = prod_t + adm_t
+    kap = cat.get("Лизинг (основной долг)", 0) + cat.get("Основные средства", 0)
+    extra = {7: round(crumb / tyres, 3) if tyres else 0, 17: round(prod_t), 26: round(adm_t),
+             27: round(full), 29: round(prod_t / crumb, 2) if crumb else 0,
+             30: round(full / crumb, 2) if crumb else 0, 35: round(kap)}
+    for r, v in extra.items():
+        updates.append({"range": col + str(r), "values": [[v]]})
     ws.batch_update(updates, value_input_option="USER_ENTERED")
     return col, crumb, created
 
@@ -1838,6 +1905,313 @@ async def cmd_kalk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ Столбец «{RU_MONTHS_FULL[month]}»{note} в «Калькуляции» заполнен: производство + расходы. "
         f"Произведено крошки: {round(crumb)} кг. Итоги и себестоимость 1 кг посчитаны.")
+
+
+# ---------- /fin: автозаполнение месячной вкладки финотчёта (v1) ----------
+# Бот заполняет ТОЛЬКО свои блоки: безнал-поступления (ERG / Юр.лица, по банкам),
+# 5 групп безнал-расходов и наличные расходы Касса 1 / Касса 2.
+# Блоки бухгалтера (ФОТ с разбивкой, налоги, лизинг, банк, снятие, переводы группы,
+# все наличные поступления) бот НЕ трогает. Строки ищутся по меткам, не по номерам.
+
+FIN_BANKS = ("Евразийский", "БЦК")
+# категория журнала «Расходы» -> группа безнал-расхода в финотчёте (метка строки)
+FIN_GROUP_OF_CAT = {
+    "Основные средства": "основные средства",
+    "Прочие капзатраты": "основные средства",
+    "Материалы и запчасти": "материалы и запасные части",
+    "ГСМ": "гсм",
+    "Транспорт и логистика": "транспортные услуги",
+    "Упаковка (мешки)": "прочие расходы",
+    "Электроэнергия": "прочие расходы",
+    "Прочие административные": "прочие расходы",
+    "Страхование": "прочие расходы",
+    "Аудит": "прочие расходы",
+}
+FIN_GROUPS = ["основные средства", "материалы и запасные части", "гсм",
+              "транспортные услуги", "прочие расходы"]
+
+
+def _fin_norm(s):
+    return re.sub(r"\s+", " ", str(s)).strip().lower()
+
+
+def _bank_of_sale_note(note):
+    """Банк из примечания продажи ('банк: БЦК'). Старые записи без банка -> Евразийский."""
+    return "БЦК" if "бцк" in str(note).lower() else "Евразийский"
+
+
+def _is_erg_buyer(buyer):
+    b = str(buyer).lower()
+    return "ссгпо" in b or "erg" in b
+
+
+def _fin_collect(month):
+    """Данные месяца из склада: безнал-поступления (продажи), безнал- и нал-расходы."""
+    skl = get_spreadsheet()
+    year = datetime.now().year
+    inc = {"erg": {b: 0.0 for b in FIN_BANKS}, "jur": {b: 0.0 for b in FIN_BANKS}}
+    for row in skl.worksheet(SHEET_SALES).get_all_values()[1:]:
+        if len(row) < 9:
+            row = row + [""] * (9 - len(row))
+        dt = parse_date_or_none(row[0])
+        if not dt or dt.year != year or dt.month != month:
+            continue
+        if "без" not in str(row[2]).lower():
+            continue
+        s = parse_num(row[6])
+        bank = _bank_of_sale_note(row[8])
+        key = "erg" if _is_erg_buyer(row[1]) else "jur"
+        inc[key][bank] += s
+    cashless = {}  # группа -> контрагент -> {банк: сумма}
+    cash = {"Касса 1": {}, "Касса 2": {}}  # касса -> метка -> сумма
+    try:
+        rows = skl.worksheet(SHEET_EXPENSES).get_all_values()[1:]
+    except gspread.WorksheetNotFound:
+        rows = []
+    for row in rows:
+        if len(row) < 8:
+            row = row + [""] * (8 - len(row))
+        dt = parse_date_or_none(row[0])
+        if not dt or dt.year != year or dt.month != month:
+            continue
+        s = parse_num(row[1])
+        if not s:
+            continue
+        cat, src, agent = str(row[3]).strip(), str(row[5]).strip(), str(row[6]).strip()
+        if src in FIN_BANKS:
+            grp = FIN_GROUP_OF_CAT.get(cat)
+            if not grp:
+                continue  # ФОТ, налоги, лизинг, банк — заполняет бухгалтер
+            name = agent or cat
+            d = cashless.setdefault(grp, {}).setdefault(name, {b: 0.0 for b in FIN_BANKS})
+            d[src] += s
+        elif src in ("Касса 1", "Касса 2"):
+            name = cat + (f" ({agent})" if agent else "")
+            cash[src][name] = cash[src].get(name, 0) + s
+    return inc, cashless, cash
+
+
+def _fin_find(grid, needle, start=0, end=None):
+    """Индекс строки (0-based), метка в колонке A начинается с needle."""
+    e = len(grid) if end is None else end
+    for i in range(start, e):
+        a = _fin_norm(grid[i][0] if grid[i] else "")
+        if a.startswith(needle):
+            return i
+    return None
+
+
+def _fin_leaf_range(grid, gi):
+    """Диапазон строк-листьев группы из формулы B '=SUM(B22:B24)'. None — группа без листьев."""
+    b = str(grid[gi][1]) if len(grid[gi]) > 1 else ""
+    m = re.search(r"SUM\(B(\d+)(?::B(\d+))?\)", b, re.I)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2) or m.group(1))
+
+
+def _fin_insert_rows(book, ws, after_row, count):
+    """Вставляет count строк ПОСЛЕ 1-based строки after_row (внутри диапазона, формат сверху)."""
+    book.batch_update({"requests": [{"insertDimension": {
+        "range": {"sheetId": ws.id, "dimension": "ROWS",
+                  "startIndex": after_row, "endIndex": after_row + count},
+        "inheritFromBefore": True}}]})
+
+
+def _fill_fin(month):
+    """Заполняет вкладку месяца в финотчёте. Возвращает текст-сводку."""
+    inc, cashless, cash = _fin_collect(month)
+    book = _get_client().open_by_key(SEBES_FILE_ID)
+    name = RU_MONTHS_FULL[month]
+    year = datetime.now().year
+    created = False
+    try:
+        ws = book.worksheet(name)
+    except gspread.WorksheetNotFound:
+        prev = None
+        for m in range(month - 1, 0, -1):
+            try:
+                prev = book.worksheet(RU_MONTHS_FULL[m])
+                break
+            except gspread.WorksheetNotFound:
+                continue
+        if prev is None:
+            raise RuntimeError("не нашёл вкладку прошлого месяца как шаблон")
+        ws = prev.duplicate(new_sheet_name=name, insert_sheet_index=prev.index + 1)
+        created = True
+
+    grid = ws.get(value_render_option="FORMULA")
+    zeroed = False
+    head = _fin_norm(grid[0][0] if grid and grid[0] else "")
+    if name not in head:
+        # первый запуск месяца: обнуляем все числа (формулы не трогаем), правим заголовок
+        ups = [{"range": "A1",
+                "values": [[f'Отчёт ТОО "Едiл и компания" за {name.upper()} {year} г.']]}]
+        for i, row in enumerate(grid[3:], start=4):
+            for j in (1, 2, 3):
+                v = row[j] if len(row) > j else ""
+                if v == "" or str(v).startswith("="):
+                    continue
+                ups.append({"range": "ABCD"[j] + str(i), "values": [[0]]})
+        ws.batch_update(ups, value_input_option="USER_ENTERED")
+        zeroed = True
+        grid = ws.get(value_render_option="FORMULA")
+
+    i_rash = _fin_find(grid, "безналичный расход")
+    i_nalpost = _fin_find(grid, "наличные поступления")
+    i_nalrash = _fin_find(grid, "наличные расходы")
+    if None in (i_rash, i_nalpost, i_nalrash):
+        raise RuntimeError("не нашёл разделы вкладки (БЕЗНАЛИЧНЫЙ РАСХОД / НАЛИЧНЫЕ ...)")
+
+    # 1) безнал-поступления от продаж: ERG и Юр.лица, по банкам
+    ups = []
+    for needle, key in (("erg", "erg"), ("юр", "jur")):
+        i = _fin_find(grid, needle, 0, i_rash)
+        if i is not None:
+            ups.append({"range": f"B{i + 1}", "values": [[round(inc[key]["Евразийский"], 2)]]})
+            ups.append({"range": f"C{i + 1}", "values": [[round(inc[key]["БЦК"], 2)]]})
+    if ups:
+        ws.batch_update(ups, value_input_option="USER_ENTERED")
+
+    # 2) наличные расходы: Касса 2, затем Касса 1 (снизу вверх, чтобы вставки не сдвигали)
+    for kassa in ("Касса 2", "Касса 1"):
+        h = _fin_find(grid, _fin_norm(kassa), i_nalrash)
+        if h is None:
+            continue
+        it = _fin_find(grid, "итого касса", h + 1)
+        if it is None:
+            continue
+        r1, r2 = h + 2, it  # 1-based листья
+        items = sorted(cash[kassa].items(), key=lambda kv: -kv[1])
+        need = max(len(items), 1)
+        ins = need - (r2 - r1 + 1)
+        if ins > 0:
+            _fin_insert_rows(book, ws, r1, ins)
+            r2 += ins
+        data = []
+        for k in range(r2 - r1 + 1):
+            r = r1 + k
+            if k < len(items):
+                nm, v = items[k]
+                data.append({"range": f"A{r}", "values": [["    " + nm]]})
+                data.append({"range": f"D{r}", "values": [[round(v, 2)]]})
+            else:
+                data.append({"range": f"A{r}", "values": [["    —"]]})
+                data.append({"range": f"D{r}", "values": [[0]]})
+        data.append({"range": f"D{r2 + 1}", "values": [[f"=SUM(D{r1}:D{r2})"]]})
+        ws.batch_update(data, value_input_option="USER_ENTERED")
+
+    # 3) безнал-расходы: 5 групп бота, снизу вверх
+    for gname in reversed(FIN_GROUPS):
+        gi = _fin_find(grid, gname, i_rash, i_nalpost)
+        if gi is None:
+            continue
+        items = sorted(cashless.get(gname, {}).items(),
+                       key=lambda kv: -(kv[1]["Евразийский"] + kv[1]["БЦК"]))
+        rng = _fin_leaf_range(grid, gi)
+        if rng is None:
+            # группа без листьев (например ГСМ): пишем суммы прямо в строку группы
+            te = sum(v["Евразийский"] for _, v in items)
+            tb = sum(v["БЦК"] for _, v in items)
+            ws.batch_update([{"range": f"B{gi + 1}", "values": [[round(te, 2)]]},
+                             {"range": f"C{gi + 1}", "values": [[round(tb, 2)]]}],
+                            value_input_option="USER_ENTERED")
+            continue
+        r1, r2 = rng
+        need = max(len(items), 1)
+        ins = need - (r2 - r1 + 1)
+        if ins > 0:
+            _fin_insert_rows(book, ws, r1, ins)
+            r2 += ins
+        data = []
+        for k in range(r2 - r1 + 1):
+            r = r1 + k
+            if k < len(items):
+                nm, v = items[k]
+                data.append({"range": f"A{r}", "values": [["    " + nm]]})
+                data.append({"range": f"B{r}", "values": [[round(v["Евразийский"], 2)]]})
+                data.append({"range": f"C{r}", "values": [[round(v["БЦК"], 2)]]})
+            else:
+                data.append({"range": f"A{r}", "values": [["    —"]]})
+                data.append({"range": f"B{r}", "values": [[0]]})
+                data.append({"range": f"C{r}", "values": [[0]]})
+            data.append({"range": f"D{r}", "values": [[f"=SUM(B{r}:C{r})"]]})
+        data.append({"range": f"B{gi + 1}", "values": [[f"=SUM(B{r1}:B{r2})"]]})
+        data.append({"range": f"C{gi + 1}", "values": [[f"=SUM(C{r1}:C{r2})"]]})
+        data.append({"range": f"D{gi + 1}", "values": [[f"=SUM(B{gi + 1}:C{gi + 1})"]]})
+        ws.batch_update(data, value_input_option="USER_ENTERED")
+
+    t_inc = sum(inc[k][b] for k in inc for b in FIN_BANKS)
+    t_out = sum(v[b] for g in cashless.values() for v in g.values() for b in FIN_BANKS)
+    t_k1 = sum(cash["Касса 1"].values())
+    t_k2 = sum(cash["Касса 2"].values())
+    notes = []
+    if created:
+        notes.append("вкладка создана по шаблону прошлого месяца")
+    if zeroed:
+        notes.append("старые цифры обнулены")
+    extra = (" (" + ", ".join(notes) + ")") if notes else ""
+    return (f"✅ Финотчёт: вкладка «{name}» заполнена{extra}.\n\n"
+            f"💰 Безнал-поступления (продажи): {round(t_inc)} тнг\n"
+            f"💸 Безнал-расходы (5 групп бота): {round(t_out)} тнг\n"
+            f"💵 Нал-расходы: Касса 1 — {round(t_k1)}, Касса 2 — {round(t_k2)} тнг\n\n"
+            f"Блоки бухгалтера (ФОТ, налоги, лизинг, переводы, нал-поступления) не тронуты.")
+
+
+async def cmd_fin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Заполнить вкладку текущего месяца в финотчёте экономиста."""
+    if not is_allowed(update):
+        await update.message.reply_text("⛔ Нет доступа.")
+        return
+    month = datetime.now().month
+    await update.message.reply_text(f"📊 Заполняю финотчёт за {RU_MONTHS_FULL[month]}...")
+    try:
+        summary = await asyncio.to_thread(_fill_fin, month)
+    except Exception as e:
+        logger.error(f"fin error: {e}")
+        await update.message.reply_text(
+            f"❌ Ошибка: {e}. Проверь, что файл финотчёта открыт боту на «Редактор».")
+        return
+    await update.message.reply_text(summary)
+
+
+# ---------- авто-обновление «Калькуляции» и финотчёта после каждой записи ----------
+_refresh_lock = asyncio.Lock()
+_refresh_again = False
+
+
+async def _run_refresh():
+    """Обновляет «Калькуляцию» и финотчёт. Параллельные вызовы совмещает
+    (замок исключает гонки при вставке строк во вкладку финотчёта)."""
+    global _refresh_again
+    if _refresh_lock.locked():
+        _refresh_again = True
+        return
+    async with _refresh_lock:
+        while True:
+            _refresh_again = False
+            month = datetime.now().month
+            try:
+                await asyncio.to_thread(_fill_kalk, month)
+            except Exception as e:
+                logger.error(f"auto-kalk error: {e}")
+            try:
+                await asyncio.to_thread(_fill_fin, month)
+            except Exception as e:
+                logger.error(f"auto-fin error: {e}")
+            if not _refresh_again:
+                break
+
+
+def schedule_refresh():
+    """Фоновое обновление через несколько секунд после записи (ответ бота не задерживает)."""
+    async def _job():
+        await asyncio.sleep(5)
+        await _run_refresh()
+    try:
+        asyncio.get_running_loop().create_task(_job())
+    except RuntimeError:
+        pass  # нет цикла событий (например, в тестах) — пропускаем
 
 
 def main():
@@ -1867,6 +2241,7 @@ def main():
             S_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_date)],
             S_BUYER: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_buyer)],
             S_PAYTYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_paytype)],
+            S_BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_bank)],
             S_FRAC: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_frac)],
             S_KG: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_kg)],
             S_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_sale_price)],
@@ -1885,6 +2260,7 @@ def main():
             PHOTO_TYPE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_type_confirm)],
             PHOTO_PROD_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_prod_confirm)],
             PHOTO_SALE_PAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_sale_paytype)],
+            PHOTO_SALE_BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_sale_bank)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
@@ -1896,6 +2272,7 @@ def main():
     app.add_handler(CommandHandler("backup", cmd_backup))
     app.add_handler(CommandHandler("svod", cmd_svod))
     app.add_handler(CommandHandler("kalk", cmd_kalk))
+    app.add_handler(CommandHandler("fin", cmd_fin))
     exp_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^💸 Ввод расхода$"), manual_exp_start)],
         states={
