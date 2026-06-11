@@ -1413,6 +1413,52 @@ async def manual_exp_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return E_GROUP
 
 
+def _build_svod():
+    """Создаёт/обновляет лист «Свод расходов»: категории × месяцы, суммы из журнала «Расходы» формулами."""
+    book = get_spreadsheet()
+    title = "Свод расходов"
+    try:
+        ws = book.worksheet(title)
+        ws.clear()
+    except gspread.WorksheetNotFound:
+        ws = book.add_worksheet(title=title, rows=60, cols=15)
+    year = datetime.now().year
+    months = ["Янв", "Фев", "Мар", "Апр", "Май", "Июн", "Июл", "Авг", "Сен", "Окт", "Ноя", "Дек"]
+    data = [["Категория"] + months + ["Итого"]]
+    for grp in ("Производство", "Администрация", "Капзатраты"):
+        data.append([grp.upper()] + [""] * 13)
+        for cat in EXPENSE_GROUPS[grp]:
+            r = len(data) + 1
+            cells = [cat]
+            for mi in range(1, 13):
+                cells.append(
+                    f"=SUMIFS('Расходы'!$B:$B,'Расходы'!$D:$D,$A{r},"
+                    f"'Расходы'!$A:$A,\">=\"&DATE({year},{mi},1),"
+                    f"'Расходы'!$A:$A,\"<=\"&EOMONTH(DATE({year},{mi},1),0))"
+                )
+            cells.append(f"=SUM(B{r}:M{r})")
+            data.append(cells)
+    ws.update(range_name="A1", values=data, value_input_option="USER_ENTERED")
+    return title, year
+
+
+async def cmd_svod(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Собрать/обновить лист «Свод расходов». Только для разрешённых."""
+    if not is_allowed(update):
+        await update.message.reply_text("⛔ Нет доступа.")
+        return
+    await update.message.reply_text("📊 Собираю «Свод расходов»...")
+    try:
+        title, year = await asyncio.to_thread(_build_svod)
+    except Exception as e:
+        logger.error(f"svod error: {e}")
+        await update.message.reply_text(f"❌ Ошибка при сборке свода: {e}")
+        return
+    await update.message.reply_text(
+        f"✅ Лист «{title}» готов (год {year}). Категории × месяцы, суммы тянутся из журнала «Расходы» и обновляются сами."
+    )
+
+
 def main():
     app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
 
@@ -1467,6 +1513,7 @@ def main():
     app.add_handler(CommandHandler("last", last_records))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("backup", cmd_backup))
+    app.add_handler(CommandHandler("svod", cmd_svod))
     exp_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^💸 Ввод расхода$"), manual_exp_start)],
         states={
