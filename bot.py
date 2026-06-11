@@ -71,7 +71,7 @@ RU_MONTHS = {
 # NEW: состояние подтверждения дубля при фото-производстве
 # + доспрос нал/безнал после фото-реализации (чтобы продажа попала в отчёт)
 (PHOTO_PROD_CONFIRM, PHOTO_SALE_PAY, PHOTO_TYPE_CONFIRM) = range(21, 24)
-(E_DATE, E_AMOUNT, E_GROUP, E_CATEGORY, E_SOURCE, E_CONTRAGENT, E_NOTE, E_CONFIRM) = range(24, 32)
+(E_DATE, E_AMOUNT, E_GROUP, E_CATEGORY, E_SOURCE, E_CONTRAGENT, E_NOTE, E_CONFIRM, E_SUP_CONFIRM, E_SUP_NEW, E_SUP_EDIT) = range(24, 35)
 
 FRACTIONS = ["0-1", "1-2", "2-4", "4-6", "6-8"]
 
@@ -1256,6 +1256,138 @@ def _exp_summary(d, saved=True):
     )
 
 
+# --- Справочник поставщиков (база) ---
+SHEET_SUPPLIERS = "Поставщики"
+SUPPLIER_HEADERS = ["Поставщик"]
+SUPPLIER_FUZZY = 0.88
+_LEGAL_PREFIXES = ("товарищество с ограниченной ответственностью", "индивидуальный предприниматель",
+                   "тоо", "ип", "ао", "оао", "зао", "ооо", "чп", "кх")
+
+
+def _normalize_supplier(name):
+    s = str(name).strip().lower()
+    for ch in "«»\"'":
+        s = s.replace(ch, " ")
+    for p in _LEGAL_PREFIXES:
+        s = re.sub(r"\b" + re.escape(p) + r"\b", " ", s)
+    s = re.sub(r"[^\w\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def get_suppliers_ws():
+    return get_worksheet(SHEET_SUPPLIERS, SUPPLIER_HEADERS)
+
+
+def load_suppliers():
+    try:
+        vals = get_suppliers_ws().col_values(1)[1:]
+    except Exception as e:
+        logger.error(f"load_suppliers: {e}")
+        return []
+    return [str(v).strip() for v in vals if str(v).strip()]
+
+
+def add_supplier(name):
+    name = str(name).strip()
+    if not name:
+        return
+    try:
+        get_suppliers_ws().append_row([name], value_input_option="USER_ENTERED")
+    except Exception as e:
+        logger.error(f"add_supplier: {e}")
+
+
+def match_supplier(name):
+    """Возвращает (status, canonical): 'exact' | 'fuzzy' | 'new'."""
+    import difflib
+    norm = _normalize_supplier(name)
+    if not norm:
+        return ("new", name)
+    suppliers = load_suppliers()
+    for s in suppliers:
+        if _normalize_supplier(s) == norm:
+            return ("exact", s)
+    best, best_r = None, 0.0
+    for s in suppliers:
+        r = difflib.SequenceMatcher(None, norm, _normalize_supplier(s)).ratio()
+        if r > best_r:
+            best, best_r = s, r
+    if best is not None and best_r >= SUPPLIER_FUZZY:
+        return ("fuzzy", best)
+    return ("new", name)
+
+
+async def _supplier_resolve(update, context, name):
+    """Сверка поставщика. Возвращает следующий state или None (можно идти дальше)."""
+    context.user_data["exp"]["контрагент"] = name
+    if not name:
+        return None
+    st, cand = match_supplier(name)
+    if st == "exact":
+        context.user_data["exp"]["контрагент"] = cand
+        return None
+    if st == "fuzzy":
+        context.user_data["exp"]["_sup_cand"] = cand
+        kb = ReplyKeyboardMarkup([["✅ Да, это он", "🆕 Нет, другой"]],
+                                 resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text(f"🏢 Похоже на «{cand}» из базы. Это он?", reply_markup=kb)
+        return E_SUP_CONFIRM
+    kb = ReplyKeyboardMarkup([["✅ Да, записать", "✏️ Исправить имя"]],
+                             resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text(
+        f"🆕 Новый поставщик: «{name}». Проверь, правильно ли имя. Записать в базу?", reply_markup=kb)
+    return E_SUP_NEW
+
+
+async def _supplier_done(update, context):
+    """Дальше после поставщика: фото → группа, ручной → примечание."""
+    if context.user_data.get("exp", {}).get("_photo"):
+        kb = ReplyKeyboardMarkup([["Производство"], ["Администрация"], ["Капзатраты"]],
+                                 resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text("Выбери группу расхода:", reply_markup=kb)
+        return E_GROUP
+    await update.message.reply_text("📝 Примечание? Или «-», если нет.")
+    return E_NOTE
+
+
+async def exp_sup_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ответ на «похоже на X»."""
+    ans = update.message.text.strip().lower()
+    exp = context.user_data.get("exp", {})
+    if "да" in ans:
+        exp["контрагент"] = exp.get("_sup_cand", exp.get("контрагент", ""))
+        exp.pop("_sup_cand", None)
+        return await _supplier_done(update, context)
+    exp.pop("_sup_cand", None)
+    name = exp.get("контрагент", "")
+    kb = ReplyKeyboardMarkup([["✅ Да, записать", "✏️ Исправить имя"]],
+                             resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text(
+        f"🆕 Новый поставщик: «{name}». Проверь, правильно ли имя. Записать в базу?", reply_markup=kb)
+    return E_SUP_NEW
+
+
+async def exp_sup_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждение нового поставщика перед записью в базу."""
+    ans = update.message.text.strip().lower()
+    exp = context.user_data.get("exp", {})
+    if "да" in ans or "запис" in ans:
+        add_supplier(exp.get("контрагент", ""))
+        return await _supplier_done(update, context)
+    await update.message.reply_text("✏️ Введи правильное имя поставщика:")
+    return E_SUP_EDIT
+
+
+async def exp_sup_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Исправленное имя → повторная сверка."""
+    name = update.message.text.strip()
+    nxt = await _supplier_resolve(update, context, name)
+    if nxt is not None:
+        return nxt
+    return await _supplier_done(update, context)
+
+
 async def manual_exp_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text("⛔ Нет доступа.")
@@ -1340,7 +1472,10 @@ async def manual_exp_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def manual_exp_contragent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
-    context.user_data["exp"]["контрагент"] = "" if t in ("-", "—") else t
+    name = "" if t in ("-", "—") else t
+    nxt = await _supplier_resolve(update, context, name)
+    if nxt is not None:
+        return nxt
     await update.message.reply_text("📝 Примечание? Или «-», если нет.")
     return E_NOTE
 
@@ -1409,12 +1544,15 @@ async def manual_exp_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif "центркредит" in bank_raw or "бцк" in bank_raw or "centercredit" in bank_raw:
         context.user_data["exp"]["источник"] = "БЦК"
     d = context.user_data["exp"]
+    await update.message.reply_text(
+        f"💸 Распознал:\n💵 Сумма: {d['сумма']} тнг\n🏢 Контрагент: {d['контрагент'] or '—'}\n📅 Дата: {d['дата']}"
+    )
+    nxt = await _supplier_resolve(update, context, context.user_data["exp"].get("контрагент", ""))
+    if nxt is not None:
+        return nxt
     kb = ReplyKeyboardMarkup([["Производство"], ["Администрация"], ["Капзатраты"]],
                              resize_keyboard=True, one_time_keyboard=True)
-    await update.message.reply_text(
-        f"💸 Распознал:\n💵 Сумма: {d['сумма']} тнг\n🏢 Контрагент: {d['контрагент'] or '—'}\n📅 Дата: {d['дата']}\n\nВыбери группу расхода:",
-        reply_markup=kb,
-    )
+    await update.message.reply_text("Выбери группу расхода:", reply_markup=kb)
     return E_GROUP
 
 
@@ -1644,6 +1782,9 @@ def main():
             E_CONTRAGENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_contragent)],
             E_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_note)],
             E_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_exp_confirm)],
+            E_SUP_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, exp_sup_confirm)],
+            E_SUP_NEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, exp_sup_new)],
+            E_SUP_EDIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, exp_sup_edit)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
