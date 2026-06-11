@@ -1432,9 +1432,9 @@ def _build_svod():
             cells = [cat]
             for mi in range(1, 13):
                 cells.append(
-                    f"=SUMIFS('Расходы'!$B:$B,'Расходы'!$D:$D,$A{r},"
-                    f"'Расходы'!$A:$A,\">=\"&DATE({year},{mi},1),"
-                    f"'Расходы'!$A:$A,\"<=\"&EOMONTH(DATE({year},{mi},1),0))"
+                    f"=SUMIFS('Расходы'!$B:$B;'Расходы'!$D:$D;$A{r};"
+                    f"'Расходы'!$A:$A;\">=\"&DATE({year};{mi};1);"
+                    f"'Расходы'!$A:$A;\"<=\"&EOMONTH(DATE({year};{mi};1);0))"
                 )
             cells.append(f"=SUM(B{r}:M{r})")
             data.append(cells)
