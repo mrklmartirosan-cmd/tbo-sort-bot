@@ -2761,7 +2761,7 @@ def _fin_collect(month):
     """Данные месяца из склада: безнал-поступления (продажи), безнал- и нал-расходы."""
     skl = get_spreadsheet()
     year = datetime.now().year
-    inc = {"erg": {b: 0.0 for b in FIN_BANKS}, "jur": {b: 0.0 for b in FIN_BANKS}}
+    inc = {"erg": {b: 0.0 for b in FIN_BANKS}, "jur_by": {}}
     salary = {b: 0.0 for b in FIN_BANKS}
     fot_tax = {}  # вид налога ФОТ -> {банк: сумма}
     for row in skl.worksheet(SHEET_SALES).get_all_values()[1:]:
@@ -2774,8 +2774,12 @@ def _fin_collect(month):
             continue
         s = parse_num(row[6])
         bank = _bank_of_sale_note(row[8])
-        key = "erg" if _is_erg_buyer(row[1]) else "jur"
-        inc[key][bank] += s
+        if _is_erg_buyer(row[1]):
+            inc["erg"][bank] += s
+        else:
+            buyer = str(row[1]).strip() or "(без имени)"
+            d0 = inc["jur_by"].setdefault(buyer, {b: 0.0 for b in FIN_BANKS})
+            d0[bank] += s
     cashless = {}  # группа -> контрагент -> {банк: сумма}
     cash = {"Касса 1": {}, "Касса 2": {}}  # касса -> метка -> сумма
     try:
@@ -2840,6 +2844,44 @@ def _fin_insert_rows(book, ws, after_row, count):
         "inheritFromBefore": True}}]})
 
 
+def _fin_write_group_leaves(book, ws, grid, gi, items):
+    """Переписывает подстроки группы (контрагент × банки). Если подстрок нет — создаёт.
+    items: [(имя, {банк: сумма}), ...]. gi — 0-based строка группы."""
+    rng = _fin_leaf_range(grid, gi)
+    if rng is None and not items:
+        ws.batch_update([{"range": f"B{gi + 1}", "values": [[0]]},
+                         {"range": f"C{gi + 1}", "values": [[0]]}],
+                        value_input_option="USER_ENTERED")
+        return
+    if rng is None:
+        _fin_insert_rows(book, ws, gi + 1, len(items))
+        r1, r2 = gi + 2, gi + 1 + len(items)
+    else:
+        r1, r2 = rng
+        need = max(len(items), 1)
+        ins = need - (r2 - r1 + 1)
+        if ins > 0:
+            _fin_insert_rows(book, ws, r1, ins)
+            r2 += ins
+    data = []
+    for k in range(r2 - r1 + 1):
+        r = r1 + k
+        if k < len(items):
+            nm, v = items[k]
+            data.append({"range": f"A{r}", "values": [["    " + nm]]})
+            data.append({"range": f"B{r}", "values": [[round(v["Евразийский"], 2)]]})
+            data.append({"range": f"C{r}", "values": [[round(v["БЦК"], 2)]]})
+        else:
+            data.append({"range": f"A{r}", "values": [["    —"]]})
+            data.append({"range": f"B{r}", "values": [[0]]})
+            data.append({"range": f"C{r}", "values": [[0]]})
+        data.append({"range": f"D{r}", "values": [[f"=SUM(B{r}:C{r})"]]})
+    data.append({"range": f"B{gi + 1}", "values": [[f"=SUM(B{r1}:B{r2})"]]})
+    data.append({"range": f"C{gi + 1}", "values": [[f"=SUM(C{r1}:C{r2})"]]})
+    data.append({"range": f"D{gi + 1}", "values": [[f"=SUM(B{gi + 1}:C{gi + 1})"]]})
+    ws.batch_update(data, value_input_option="USER_ENTERED")
+
+
 def _fill_fin(month):
     """Заполняет вкладку месяца в финотчёте. Возвращает текст-сводку."""
     inc, cashless, cash, salary, fot_tax = _fin_collect(month)
@@ -2885,15 +2927,14 @@ def _fill_fin(month):
     if None in (i_rash, i_nalpost, i_nalrash):
         raise RuntimeError("не нашёл разделы вкладки (БЕЗНАЛИЧНЫЙ РАСХОД / НАЛИЧНЫЕ ...)")
 
-    # 1) безнал-поступления от продаж: ERG и Юр.лица, по банкам
-    ups = []
-    for needle, key in (("erg", "erg"), ("юр", "jur")):
-        i = _fin_find(grid, needle, 0, i_rash)
-        if i is not None:
-            ups.append({"range": f"B{i + 1}", "values": [[round(inc[key]["Евразийский"], 2)]]})
-            ups.append({"range": f"C{i + 1}", "values": [[round(inc[key]["БЦК"], 2)]]})
-    if ups:
-        ws.batch_update(ups, value_input_option="USER_ENTERED")
+    # 1) безнал-поступления от продаж: ERG (один контрагент — пишем в строку);
+    # Юр.лица раскладываются по покупателям в самом конце (шаг 4), т.к. там вставка строк
+    i = _fin_find(grid, "erg", 0, i_rash)
+    if i is not None:
+        ws.batch_update([
+            {"range": f"B{i + 1}", "values": [[round(inc['erg']['Евразийский'], 2)]]},
+            {"range": f"C{i + 1}", "values": [[round(inc['erg']['БЦК'], 2)]]},
+        ], value_input_option="USER_ENTERED")
 
     # 1.5) блок ФОТ: зарплата + оплаченные налоги ФОТ (по ведомости через бот).
     # Исполнительные листы — бухгалтер, не трогаем.
@@ -2959,51 +3000,25 @@ def _fill_fin(month):
         data.append({"range": f"D{r2 + 1}", "values": [[f"=SUM(D{r1}:D{r2})"]]})
         ws.batch_update(data, value_input_option="USER_ENTERED")
 
-    # 3) безнал-расходы: 5 групп бота, снизу вверх
+    # 3) безнал-расходы: группы бота, снизу вверх (контрагенты — подстроками)
     for gname in reversed(FIN_GROUPS):
         gi = _fin_find(grid, gname, i_rash, i_nalpost)
         if gi is None:
             continue
         items = sorted(cashless.get(gname, {}).items(),
                        key=lambda kv: -(kv[1]["Евразийский"] + kv[1]["БЦК"]))
-        rng = _fin_leaf_range(grid, gi)
-        if rng is None and not items:
-            # строка-группа без подстрок и без данных — просто нули
-            ws.batch_update([{"range": f"B{gi + 1}", "values": [[0]]},
-                             {"range": f"C{gi + 1}", "values": [[0]]}],
-                            value_input_option="USER_ENTERED")
-            continue
-        if rng is None:
-            # строка-группа без подстрок (как ГСМ): превращаем в группу с контрагентами,
-            # чтобы было видно, кому платили — как в «Прочих расходах»
-            _fin_insert_rows(book, ws, gi + 1, len(items))
-            r1, r2 = gi + 2, gi + 1 + len(items)
-        else:
-            r1, r2 = rng
-            need = max(len(items), 1)
-            ins = need - (r2 - r1 + 1)
-            if ins > 0:
-                _fin_insert_rows(book, ws, r1, ins)
-                r2 += ins
-        data = []
-        for k in range(r2 - r1 + 1):
-            r = r1 + k
-            if k < len(items):
-                nm, v = items[k]
-                data.append({"range": f"A{r}", "values": [["    " + nm]]})
-                data.append({"range": f"B{r}", "values": [[round(v["Евразийский"], 2)]]})
-                data.append({"range": f"C{r}", "values": [[round(v["БЦК"], 2)]]})
-            else:
-                data.append({"range": f"A{r}", "values": [["    —"]]})
-                data.append({"range": f"B{r}", "values": [[0]]})
-                data.append({"range": f"C{r}", "values": [[0]]})
-            data.append({"range": f"D{r}", "values": [[f"=SUM(B{r}:C{r})"]]})
-        data.append({"range": f"B{gi + 1}", "values": [[f"=SUM(B{r1}:B{r2})"]]})
-        data.append({"range": f"C{gi + 1}", "values": [[f"=SUM(C{r1}:C{r2})"]]})
-        data.append({"range": f"D{gi + 1}", "values": [[f"=SUM(B{gi + 1}:C{gi + 1})"]]})
-        ws.batch_update(data, value_input_option="USER_ENTERED")
+        _fin_write_group_leaves(book, ws, grid, gi, items)
 
-    t_inc = sum(inc[k][b] for k in inc for b in FIN_BANKS)
+    # 4) Юр.лица: раскладываем по ПОКУПАТЕЛЯМ (кто сколько оплатил) — в самом конце,
+    # т.к. вставка строк вверху сдвигает всё ниже (уже записанное переедет вместе со строками)
+    gi = _fin_find(grid, "юр", 0, i_rash)
+    if gi is not None:
+        items = sorted(inc["jur_by"].items(),
+                       key=lambda kv: -(kv[1]["Евразийский"] + kv[1]["БЦК"]))
+        _fin_write_group_leaves(book, ws, grid, gi, items)
+
+    t_inc = sum(inc["erg"].values()) + sum(
+        v[b] for v in inc["jur_by"].values() for b in FIN_BANKS)
     t_out = sum(v[b] for g in cashless.values() for v in g.values() for b in FIN_BANKS)
     t_k1 = sum(cash["Касса 1"].values())
     t_k2 = sum(cash["Касса 2"].values())
