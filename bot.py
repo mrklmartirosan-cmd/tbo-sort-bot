@@ -76,6 +76,8 @@ RU_MONTHS = {
 (S_BANK, PHOTO_SALE_BANK) = range(35, 37)
 # NEW: доспрос недостающего по фото-продаже (платёжка без кол-ва/цены/НДС)
 (PHOTO_SALE_KG, PHOTO_SALE_PRICE, PHOTO_SALE_VAT) = range(37, 40)
+# NEW: ведомость ФОТ (зарплата): дата перечисления, банк, подтверждение
+(PAYROLL_DATE, PAYROLL_BANK, PAYROLL_CONFIRM) = range(40, 43)
 
 FRACTIONS = ["0-1", "1-2", "2-4", "4-6", "6-8"]
 
@@ -990,6 +992,95 @@ async def photo_sale_vat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await _photo_sale_followup(update, context)
 
 
+async def recognize_payroll(image_bytes: bytes):
+    """Распознаёт расчётную ведомость по зарплате: итоги АУП / Производство / Итого, банк."""
+    image_b64 = base64.b64encode(image_bytes).decode()
+    prompt = (
+        "Это фото расчётной ведомости организации по заработной плате.\n"
+        "Верни ТОЛЬКО JSON без markdown:\n"
+        '{"месяц":"месяц и год из заголовка","ауп":0,"производство":0,"итого":0,'
+        '"банк":"банк, куда перечислено (из шапки колонки), если виден"}\n'
+        "ауп — ИТОГ раздела АУП (административный персонал); производство — ИТОГ раздела "
+        "ПРОИЗВОДСТВО; итого — общий итог ведомости. Бери именно итоговые строки разделов, "
+        "не суммы по отдельным сотрудникам. Если что-то не читается — 0 или пусто."
+    )
+    return await call_claude(image_b64, prompt)
+
+
+async def payroll_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip().lower()
+    d = context.user_data.get("pending_payroll", {})
+    if t in ("сегодня", "today"):
+        d["дата"] = datetime.now().strftime("%d.%m.%Y")
+    else:
+        dt = parse_date_or_none(t)
+        if dt is None:
+            await update.message.reply_text("⚠️ Не понял дату. Введи дд.мм.гггг или «сегодня».")
+            return PAYROLL_DATE
+        d["дата"] = date_to_str(dt)
+    if not d.get("банк"):
+        kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["❌ Отмена"]],
+                                 resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text("🏦 С какого банка перечислена зарплата?", reply_markup=kb)
+        return PAYROLL_BANK
+    return await _payroll_confirm_ask(update, context)
+
+
+async def payroll_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    val = update.message.text.strip().lower()
+    if "евраз" in val:
+        bank = "Евразийский"
+    elif "бцк" in val or "bcc" in val:
+        bank = "БЦК"
+    else:
+        await update.message.reply_text("⚠️ Выбери: Евразийский или БЦК")
+        return PAYROLL_BANK
+    context.user_data.get("pending_payroll", {})["банк"] = bank
+    return await _payroll_confirm_ask(update, context)
+
+
+async def _payroll_confirm_ask(update, context):
+    d = context.user_data.get("pending_payroll", {})
+    kb = ReplyKeyboardMarkup([["✅ Да, сохранить"], ["❌ Отмена"]],
+                             resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text(
+        f"Проверь зарплату перед сохранением:\n\n"
+        f"📅 Дата перечисления: {d.get('дата', '—')}\n"
+        f"🏦 Банк: {d.get('банк', '—')}\n"
+        f"👔 ФОТ административный (АУП): {round(d.get('ауп', 0))} тнг\n"
+        f"🏭 ФОТ производственный: {round(d.get('производство', 0))} тнг\n"
+        f"💰 Всего: {round(d.get('ауп', 0) + d.get('производство', 0))} тнг\n\n"
+        f"Запишу ДВЕ строки в журнал «Расходы» — всё разнесётся по отчётам само.",
+        reply_markup=kb)
+    return PAYROLL_CONFIRM
+
+
+async def payroll_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ans = update.message.text.strip().lower()
+    d = context.user_data.get("pending_payroll", {})
+    if "да" in ans or "сохран" in ans:
+        base = {"дата": d.get("дата", ""), "источник": d.get("банк", ""), "контрагент": "",
+                "примечание": f"зарплата по ведомости за {d.get('месяц') or '—'}"}
+        n = 0
+        if parse_num(d.get("производство", 0)):
+            save_expense({**base, "сумма": d["производство"],
+                          "группа": "Производство", "категория": "ФОТ производственный"})
+            n += 1
+        if parse_num(d.get("ауп", 0)):
+            save_expense({**base, "сумма": d["ауп"],
+                          "группа": "Администрация", "категория": "ФОТ административный"})
+            n += 1
+        schedule_refresh()
+        context.user_data.pop("pending_payroll", None)
+        await update.message.reply_text(
+            f"✅ Зарплата сохранена ({n} строк в журнале). Финотчёт и «Калькуляция» обновятся сами. "
+            f"Налоги ФОТ (8 строк) — за бухгалтером, как договорились.")
+        return ConversationHandler.END
+    context.user_data.pop("pending_payroll", None)
+    await update.message.reply_text("❌ Отменено, ничего не сохранено.")
+    return ConversationHandler.END
+
+
 async def photo_sale_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Доспрос банка после фото-реализации (безнал) — для финотчёта."""
     val = update.message.text.strip().lower()
@@ -1018,8 +1109,11 @@ async def detect_doc_type(image_bytes: bytes):
         "фракции крошки, цены, суммы, НДС;\n"
         "- ОТЧЁТ ПРОИЗВОДСТВА крошки: смена, оператор, вес шин, фракции в кг, мешки;\n"
         "- РАСХОДНЫЙ ДОКУМЕНТ: платёжное поручение, счёт на оплату, чек, квитанция — компания "
-        "ПЛАТИТ поставщику. Если плательщик — ТОО «Еділ и компания», это расход.\n"
-        'Верни ТОЛЬКО JSON: {"тип":"реализация"} или {"тип":"производство"} или {"тип":"расход"}.'
+        "ПЛАТИТ поставщику. Если плательщик — ТОО «Еділ и компания», это расход;\n"
+        "- РАСЧЁТНАЯ ВЕДОМОСТЬ по заработной плате: список сотрудников с должностями, разделы "
+        "АУП и ПРОИЗВОДСТВО, колонка «перечислено в банк», итоги.\n"
+        'Верни ТОЛЬКО JSON: {"тип":"реализация"} или {"тип":"производство"} или {"тип":"расход"} '
+        'или {"тип":"ведомость"}.'
     )
     try:
         res = await call_claude(image_b64, prompt)
@@ -1027,6 +1121,8 @@ async def detect_doc_type(image_bytes: bytes):
     except Exception as e:
         logger.error(f"detect_doc_type error: {e}")
         t = ""
+    if "ведомост" in t:
+        return "payroll"
     if "расход" in t:
         return "expense"
     return "sale" if "реализ" in t else "production"
@@ -1046,12 +1142,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["pending_photo"] = {"file_id": photo.file_id, "type": doc_type}
         labels = {"sale": "📄 РЕАЛИЗАЦИЯ (накладная)",
                   "production": "📸 ПРОИЗВОДСТВО (отчёт)",
-                  "expense": "💸 РАСХОД (платёжка / счёт / чек)"}
-        others = {"sale": ["🔁 Это производство", "🔁 Это расход"],
-                  "production": ["🔁 Это реализация", "🔁 Это расход"],
-                  "expense": ["🔁 Это реализация", "🔁 Это производство"]}
+                  "expense": "💸 РАСХОД (платёжка / счёт / чек)",
+                  "payroll": "🧾 ВЕДОМОСТЬ ФОТ (зарплата)"}
+        alt = {"sale": "🔁 Это реализация", "production": "🔁 Это производство",
+               "expense": "🔁 Это расход", "payroll": "🔁 Это ведомость ФОТ"}
+        others = [alt[k] for k in ("sale", "production", "expense", "payroll") if k != doc_type]
         label = labels[doc_type]
-        kb = ReplyKeyboardMarkup([["✅ Да, верно"], others[doc_type], ["❌ Отмена"]],
+        kb = ReplyKeyboardMarkup([["✅ Да, верно"], others[:2], others[2:], ["❌ Отмена"]],
                                  resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text(
             f"Определил: {label}\n\nВерно? Подтверди — распознаю и сохраню.",
@@ -1073,6 +1170,8 @@ async def photo_type_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
     if "да" in ans or "верно" in ans:
         photo_type = pending["type"]
+    elif "ведомост" in ans:
+        photo_type = "payroll"
     elif "расход" in ans:
         photo_type = "expense"
     elif "производ" in ans:
@@ -1097,6 +1196,35 @@ async def photo_type_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def _dispatch_photo(update, context, photo_type, image_bytes):
     """Распознаёт и сохраняет фото по подтверждённому типу."""
     try:
+        if photo_type == "payroll":
+            await update.message.reply_text("🧾 Распознаю ведомость ФОТ...")
+            data = await recognize_payroll(image_bytes)
+            logger.info(f"Payroll data: {data}")
+            aup = parse_num(data.get("ауп", 0))
+            prod = parse_num(data.get("производство", 0))
+            total = parse_num(data.get("итого", 0))
+            if not aup and not prod:
+                await update.message.reply_text(
+                    "❌ Не смог прочитать итоги АУП/Производство с ведомости. Переснимай чётче — "
+                    "нужны строки «АУП», «ПРОИЗВОДСТВО» и «Итого».")
+                return ConversationHandler.END
+            warn = ""
+            if total and round(aup + prod) != round(total):
+                warn = (f"\n⚠️ Сверка не сошлась: АУП {round(aup)} + Производство {round(prod)} "
+                        f"= {round(aup + prod)}, а «Итого» на бланке {round(total)}. Проверь внимательно!")
+            bank_raw = str(data.get("банк", "")).lower()
+            bank = ("Евразийский" if "евраз" in bank_raw
+                    else "БЦК" if ("бцк" in bank_raw or "центркредит" in bank_raw) else "")
+            context.user_data["pending_payroll"] = {
+                "месяц": str(data.get("месяц", "")).strip(),
+                "ауп": aup, "производство": prod, "банк": bank}
+            await update.message.reply_text(
+                f"🧾 Ведомость за {data.get('месяц') or '—'}:\n"
+                f"👔 АУП: {round(aup)} тнг\n🏭 Производство: {round(prod)} тнг\n"
+                f"💰 Всего: {round(aup + prod)} тнг{warn}\n\n"
+                "📅 Какой ДАТОЙ перечислена зарплата? (дд.мм.гггг или «сегодня»)")
+            return PAYROLL_DATE
+
         if photo_type == "expense":
             await update.message.reply_text("💸 Распознаю расходный документ...")
             data = await recognize_expense(image_bytes)
@@ -2116,6 +2244,7 @@ def _fin_collect(month):
     skl = get_spreadsheet()
     year = datetime.now().year
     inc = {"erg": {b: 0.0 for b in FIN_BANKS}, "jur": {b: 0.0 for b in FIN_BANKS}}
+    salary = {b: 0.0 for b in FIN_BANKS}
     for row in skl.worksheet(SHEET_SALES).get_all_values()[1:]:
         if len(row) < 9:
             row = row + [""] * (9 - len(row))
@@ -2145,16 +2274,19 @@ def _fin_collect(month):
             continue
         cat, src, agent = str(row[3]).strip(), str(row[5]).strip(), str(row[6]).strip()
         if src in FIN_BANKS:
+            if cat in ("ФОТ производственный", "ФОТ административный"):
+                salary[src] += s  # зарплата на карты — строка внутри блока ФОТ
+                continue
             grp = FIN_GROUP_OF_CAT.get(cat)
             if not grp:
-                continue  # ФОТ, налоги, банк — заполняет бухгалтер
+                continue  # налоги, банк — заполняет бухгалтер
             name = FIN_LEAF_NAME.get(cat) or agent or cat
             d = cashless.setdefault(grp, {}).setdefault(name, {b: 0.0 for b in FIN_BANKS})
             d[src] += s
         elif src in ("Касса 1", "Касса 2"):
             name = cat + (f" ({agent})" if agent else "")
             cash[src][name] = cash[src].get(name, 0) + s
-    return inc, cashless, cash
+    return inc, cashless, cash, salary
 
 
 def _fin_find(grid, needle, start=0, end=None):
@@ -2186,7 +2318,7 @@ def _fin_insert_rows(book, ws, after_row, count):
 
 def _fill_fin(month):
     """Заполняет вкладку месяца в финотчёте. Возвращает текст-сводку."""
-    inc, cashless, cash = _fin_collect(month)
+    inc, cashless, cash, salary = _fin_collect(month)
     book = _get_client().open_by_key(SEBES_FILE_ID)
     name = RU_MONTHS_FULL[month]
     year = datetime.now().year
@@ -2238,6 +2370,19 @@ def _fill_fin(month):
             ups.append({"range": f"C{i + 1}", "values": [[round(inc[key]["БЦК"], 2)]]})
     if ups:
         ws.batch_update(ups, value_input_option="USER_ENTERED")
+
+    # 1.5) зарплата на карты — строка «Заработная плата» внутри блока ФОТ.
+    # Остальные строки ФОТ (исполнительные листы, 8 налогов) — бухгалтер, не трогаем.
+    if salary["Евразийский"] or salary["БЦК"]:
+        gi_fot = _fin_find(grid, "фот", i_rash, i_nalpost)
+        rng_fot = _fin_leaf_range(grid, gi_fot) if gi_fot is not None else None
+        if rng_fot:
+            zi = _fin_find(grid, "заработная плата", rng_fot[0] - 1, rng_fot[1])
+            if zi is not None:
+                ws.batch_update([
+                    {"range": f"B{zi + 1}", "values": [[round(salary["Евразийский"], 2)]]},
+                    {"range": f"C{zi + 1}", "values": [[round(salary["БЦК"], 2)]]},
+                ], value_input_option="USER_ENTERED")
 
     # 2) наличные расходы: Касса 2, затем Касса 1 (снизу вверх, чтобы вставки не сдвигали)
     for kassa in ("Касса 2", "Касса 1"):
@@ -2321,11 +2466,13 @@ def _fill_fin(month):
     if zeroed:
         notes.append("старые цифры обнулены")
     extra = (" (" + ", ".join(notes) + ")") if notes else ""
+    t_sal = sum(salary.values())
     return (f"✅ Финотчёт: вкладка «{name}» заполнена{extra}.\n\n"
             f"💰 Безнал-поступления (продажи): {round(t_inc)} тнг\n"
-            f"💸 Безнал-расходы (5 групп бота): {round(t_out)} тнг\n"
+            f"💸 Безнал-расходы (группы бота): {round(t_out)} тнг\n"
+            f"👥 Зарплата на карты (ФОТ): {round(t_sal)} тнг\n"
             f"💵 Нал-расходы: Касса 1 — {round(t_k1)}, Касса 2 — {round(t_k2)} тнг\n\n"
-            f"Блоки бухгалтера (ФОТ, налоги, лизинг, переводы, нал-поступления) не тронуты.")
+            f"Блоки бухгалтера (налоги ФОТ, прочие налоги, переводы, нал-поступления) не тронуты.")
 
 
 async def cmd_fin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2683,6 +2830,9 @@ def main():
             PHOTO_SALE_KG: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_sale_kg)],
             PHOTO_SALE_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_sale_price)],
             PHOTO_SALE_VAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_sale_vat)],
+            PAYROLL_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, payroll_date)],
+            PAYROLL_BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, payroll_bank)],
+            PAYROLL_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, payroll_confirm)],
             **_exp_states(),  # фото-расход продолжает шаги расхода прямо здесь
         },
         fallbacks=[CommandHandler("cancel", cancel)],
