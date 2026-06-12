@@ -74,6 +74,8 @@ RU_MONTHS = {
 (E_DATE, E_AMOUNT, E_GROUP, E_CATEGORY, E_SOURCE, E_CONTRAGENT, E_NOTE, E_CONFIRM, E_SUP_CONFIRM, E_SUP_NEW, E_SUP_EDIT) = range(24, 35)
 # NEW: банк поступления при безнал-продаже (ручной ввод и фото) — для финотчёта
 (S_BANK, PHOTO_SALE_BANK) = range(35, 37)
+# NEW: доспрос недостающего по фото-продаже (платёжка без кол-ва/цены/НДС)
+(PHOTO_SALE_KG, PHOTO_SALE_PRICE, PHOTO_SALE_VAT) = range(37, 40)
 
 FRACTIONS = ["0-1", "1-2", "2-4", "4-6", "6-8"]
 
@@ -707,7 +709,7 @@ async def manual_sale_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def manual_sale_buyer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["sale"]["покупатель"] = update.message.text.strip()
-    kb = ReplyKeyboardMarkup([["Безналичный", "Наличный"]], resize_keyboard=True, one_time_keyboard=True)
+    kb = ReplyKeyboardMarkup([["Безналичный", "Наличный"], ["❌ Отмена"]], resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text("💳 Тип расчёта? (Безналичный / Наличный)", reply_markup=kb)
     return S_PAYTYPE
 
@@ -738,7 +740,7 @@ async def manual_sale_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Банк поступления при безнал-продаже (для финотчёта)."""
     val = update.message.text.strip().lower()
     if "назад" in val:
-        kb = ReplyKeyboardMarkup([["Безналичный", "Наличный"]], resize_keyboard=True, one_time_keyboard=True)
+        kb = ReplyKeyboardMarkup([["Безналичный", "Наличный"], ["❌ Отмена"]], resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text("💳 Тип расчёта? (Безналичный / Наличный)", reply_markup=kb)
         return S_PAYTYPE
     if "евраз" in val:
@@ -916,17 +918,83 @@ async def photo_sale_paytype(update: Update, context: ContextTypes.DEFAULT_TYPE)
                                  resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text("🏦 На какой банк придёт оплата?", reply_markup=kb)
         return PHOTO_SALE_BANK
-    await _save_sale_from_photo(update, data)
+    return await _photo_sale_followup(update, context)
+
+
+async def _photo_sale_followup(update, context):
+    """После типа расчёта/банка доспрашивает недостающее (кол-во, цену, НДС) и сохраняет.
+    Нужно для платёжек: там видна только сумма, без кг и цены."""
+    d = context.user_data.get("pending_sale", {})
+    qty = parse_num(d.get("количество_кг", 0))
+    if not qty and d.get("количество_т"):
+        qty = parse_num(d.get("количество_т", 0)) * 1000
+        d["количество_кг"] = qty
+    if not qty:
+        kb = ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text("⚖️ На документе не видно количество. Сколько КГ продали?",
+                                        reply_markup=kb)
+        return PHOTO_SALE_KG
+    total = parse_num(d.get("сумма_с_ндс", 0))
+    price = parse_num(d.get("цена_за_кг", 0))
+    if not price and not total:
+        kb = ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text("💵 Цена за кг, тнг?", reply_markup=kb)
+        return PHOTO_SALE_PRICE
+    if not price:
+        d["цена_за_кг"] = round(total / qty, 2)
+    if not total:
+        d["сумма_с_ндс"] = round(qty * parse_num(d.get("цена_за_кг", 0)), 2)
+    if not parse_num(d.get("сумма_ндс", 0)) and not d.get("_ндс_решён"):
+        total = parse_num(d.get("сумма_с_ндс", 0))
+        hint = round(total * 16 / 116, 2)  # НДС в РК с 2026 г. — 16%
+        kb = ReplyKeyboardMarkup([[f"В т.ч. НДС 16% = {hint}"], ["Без НДС"], ["❌ Отмена"]],
+                                 resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text("💰 Сумма НДС не видна. Выбери кнопкой или введи число:",
+                                        reply_markup=kb)
+        return PHOTO_SALE_VAT
+    d.pop("_ндс_решён", None)
+    await _save_sale_from_photo(update, d)
     context.user_data.pop("pending_sale", None)
     context.user_data["photo_type"] = "production"
     return ConversationHandler.END
+
+
+async def photo_sale_kg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    qty = parse_num(update.message.text)
+    if not qty:
+        await update.message.reply_text("⚠️ Введи количество числом, в кг.")
+        return PHOTO_SALE_KG
+    context.user_data.get("pending_sale", {})["количество_кг"] = qty
+    return await _photo_sale_followup(update, context)
+
+
+async def photo_sale_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    price = parse_num(update.message.text)
+    if not price:
+        await update.message.reply_text("⚠️ Введи цену числом, тнг за кг.")
+        return PHOTO_SALE_PRICE
+    context.user_data.get("pending_sale", {})["цена_за_кг"] = price
+    return await _photo_sale_followup(update, context)
+
+
+async def photo_sale_vat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip().lower()
+    d = context.user_data.get("pending_sale", {})
+    if "без" in t:
+        d["сумма_ндс"] = 0
+    elif "16%" in t or "т.ч" in t:
+        d["сумма_ндс"] = round(parse_num(d.get("сумма_с_ндс", 0)) * 16 / 116, 2)
+    else:
+        d["сумма_ндс"] = parse_num(update.message.text)
+    d["_ндс_решён"] = True
+    return await _photo_sale_followup(update, context)
 
 
 async def photo_sale_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Доспрос банка после фото-реализации (безнал) — для финотчёта."""
     val = update.message.text.strip().lower()
     if "назад" in val:
-        kb = ReplyKeyboardMarkup([["Безналичный", "Наличный"]], resize_keyboard=True, one_time_keyboard=True)
+        kb = ReplyKeyboardMarkup([["Безналичный", "Наличный"], ["❌ Отмена"]], resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text("💳 Тип расчёта? (Безналичный / Наличный)", reply_markup=kb)
         return PHOTO_SALE_PAY
     if "евраз" in val:
@@ -938,10 +1006,7 @@ async def photo_sale_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return PHOTO_SALE_BANK
     data = context.user_data.get("pending_sale", {})
     data["банк"] = bank
-    await _save_sale_from_photo(update, data)
-    context.user_data.pop("pending_sale", None)
-    context.user_data["photo_type"] = "production"
-    return ConversationHandler.END
+    return await _photo_sale_followup(update, context)
 
 
 async def detect_doc_type(image_bytes: bytes):
@@ -1052,16 +1117,21 @@ async def _dispatch_photo(update, context, photo_type, image_bytes):
             if not data["тип_расчета"]:
                 # доспрашиваем, чтобы продажа попала и в отчёт «Реализация 2026г»
                 context.user_data["pending_sale"] = data
-                kb = ReplyKeyboardMarkup([["Безналичный", "Наличный"]],
+                kb = ReplyKeyboardMarkup([["Безналичный", "Наличный"], ["❌ Отмена"]],
                                          resize_keyboard=True, one_time_keyboard=True)
                 await update.message.reply_text(
                     "📄 Накладную распознал. Уточни тип расчёта, чтобы продажа попала и в отчёт:",
                     reply_markup=kb,
                 )
                 return PHOTO_SALE_PAY
-            await _save_sale_from_photo(update, data)
-            context.user_data["photo_type"] = "production"
-            return ConversationHandler.END
+            # тип расчёта распознан с фото: банк (для безнала) + доспрос недостающего
+            context.user_data["pending_sale"] = data
+            if data["тип_расчета"] == "Безналичный":
+                kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["⬅️ Назад", "❌ Отмена"]],
+                                         resize_keyboard=True, one_time_keyboard=True)
+                await update.message.reply_text("🏦 На какой банк придёт оплата?", reply_markup=kb)
+                return PHOTO_SALE_BANK
+            return await _photo_sale_followup(update, context)
 
         # --- производство ---
         data = await recognize_production(image_bytes)
@@ -2602,6 +2672,9 @@ def main():
             PHOTO_PROD_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_prod_confirm)],
             PHOTO_SALE_PAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_sale_paytype)],
             PHOTO_SALE_BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_sale_bank)],
+            PHOTO_SALE_KG: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_sale_kg)],
+            PHOTO_SALE_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_sale_price)],
+            PHOTO_SALE_VAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_sale_vat)],
             **_exp_states(),  # фото-расход продолжает шаги расхода прямо здесь
         },
         fallbacks=[CommandHandler("cancel", cancel)],
