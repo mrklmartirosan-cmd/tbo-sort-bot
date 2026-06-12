@@ -78,6 +78,8 @@ RU_MONTHS = {
 (PHOTO_SALE_KG, PHOTO_SALE_PRICE, PHOTO_SALE_VAT) = range(37, 40)
 # NEW: ведомость ФОТ (зарплата): дата перечисления, банк, подтверждение
 (PAYROLL_DATE, PAYROLL_BANK, PAYROLL_CONFIRM) = range(40, 43)
+# NEW: табель учёта рабочего времени
+(TABEL_MONTH, TABEL_CONFIRM) = range(43, 45)
 
 FRACTIONS = ["0-1", "1-2", "2-4", "4-6", "6-8"]
 
@@ -1114,6 +1116,140 @@ async def payroll_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# ---------- Табель учёта рабочего времени ----------
+SHEET_TABEL = "Табель"
+TABEL_HEADERS = ["Дата", "Сотрудник", "Должность", "Часы", "Примечание"]
+
+
+def get_tabel_ws():
+    return get_worksheet(SHEET_TABEL, TABEL_HEADERS)
+
+
+def _tabel_existing(month, year):
+    """Ключи (день, сотрудник) уже внесённых записей табеля за месяц — для дедупликации."""
+    have = set()
+    try:
+        rows = get_tabel_ws().get_all_values()[1:]
+    except Exception as e:
+        logger.error(f"tabel read error: {e}")
+        return have
+    for row in rows:
+        if len(row) < 2:
+            continue
+        dt = parse_date_or_none(row[0])
+        if not dt or dt.month != month or dt.year != year:
+            continue
+        have.add((dt.day, _fin_norm(row[1])))
+    return have
+
+
+def _tabel_period_nums(period):
+    """'июнь 2026' -> (6, 2026) или None."""
+    if not period:
+        return None
+    parts = period.split()
+    mon = next((n for n, nm in RU_MONTHS_FULL.items() if nm == parts[0]), None)
+    if not mon:
+        return None
+    year = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else datetime.now().year
+    return mon, year
+
+
+async def recognize_tabel(image_bytes: bytes):
+    """Распознаёт табель: сотрудники × дни месяца, отработанные часы."""
+    image_b64 = base64.b64encode(image_bytes).decode()
+    prompt = (
+        "Это фото табеля учёта рабочего времени: строки — сотрудники, колонки — дни месяца "
+        "(1–31), в ячейках отработанные часы (число) или отметки (В=выходной, О=отпуск, "
+        "Б=больничный — такие дни пропускай).\n"
+        "Верни ТОЛЬКО JSON без markdown:\n"
+        '{"месяц":"месяц и год из заголовка","сотрудники":[{"фио":"...","должность":"...",'
+        '"дни":{"1":8,"2":8}}]}\n'
+        "В «дни» включай ТОЛЬКО рабочие дни (ключ — номер дня, значение — часы). Если стоит "
+        "отметка выхода (Я, 1, +) без числа часов — ставь 8. Что не читается — пропусти."
+    )
+    return await call_claude(image_b64, prompt)
+
+
+async def _tabel_prepare(update, context):
+    """Считает НОВЫЕ записи табеля (дедуп по дню+сотруднику) и просит подтверждение."""
+    rawlist = context.user_data.get("pending_tabel_raw") or []
+    period = context.user_data.get("pending_tabel_period", "")
+    nums = _tabel_period_nums(period)
+    if not nums:
+        await update.message.reply_text(
+            "📅 Не понял, за какой месяц табель. Напиши, например: «июнь 2026».")
+        return TABEL_MONTH
+    mon, year = nums
+    have = await asyncio.to_thread(_tabel_existing, mon, year)
+    rows, skipped, hours, emps = [], 0, 0.0, set()
+    for emp in rawlist:
+        fio = str(emp.get("фио", "")).strip()
+        if not fio:
+            continue
+        role = str(emp.get("должность", "")).strip()
+        days = emp.get("дни") if isinstance(emp.get("дни"), dict) else {}
+        for dstr, h in days.items():
+            try:
+                day = int(str(dstr).strip())
+            except Exception:
+                continue
+            hv = parse_num(h)
+            if day < 1 or day > 31 or hv <= 0:
+                continue
+            if (day, _fin_norm(fio)) in have:
+                skipped += 1
+                continue
+            emps.add(fio)
+            hours += hv
+            rows.append([f"{day:02d}.{mon:02d}.{year}", fio, role, hv, ""])
+    if not rows:
+        if skipped:
+            msg = f"📅 Табель за {period}: новых записей нет, всё уже внесено (пропущено {skipped})."
+        else:
+            msg = "📅 В табеле не нашёл ни одного дня с часами. Переснимай чётче."
+        await update.message.reply_text(msg)
+        context.user_data.pop("pending_tabel_raw", None)
+        context.user_data.pop("pending_tabel_period", None)
+        return ConversationHandler.END
+    rows.sort(key=lambda r: (parse_date_or_none(r[0]) or datetime.min, r[1]))
+    context.user_data["pending_tabel_rows"] = rows
+    note = f"\n♻️ Уже было внесено (пропускаю): {skipped}" if skipped else ""
+    kb = ReplyKeyboardMarkup([["✅ Да, сохранить"], ["❌ Отмена"]],
+                             resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text(
+        f"📅 Табель за {period}:\n"
+        f"👥 Сотрудников: {len(emps)}\n"
+        f"🆕 Новых записей (человеко-дней): {len(rows)}\n"
+        f"⏱ Часов добавится: {round(hours)}{note}\n\nЗаписать в лист «Табель»?",
+        reply_markup=kb)
+    return TABEL_CONFIRM
+
+
+async def tabel_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    period = _norm_period(update.message.text)
+    if not period:
+        await update.message.reply_text("⚠️ Напиши месяц словом, например: «июнь 2026».")
+        return TABEL_MONTH
+    context.user_data["pending_tabel_period"] = period
+    return await _tabel_prepare(update, context)
+
+
+async def tabel_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ans = update.message.text.strip().lower()
+    rows = context.user_data.get("pending_tabel_rows") or []
+    for k in ("pending_tabel_rows", "pending_tabel_raw", "pending_tabel_period"):
+        context.user_data.pop(k, None)
+    if ("да" in ans or "сохран" in ans) and rows:
+        ws = await asyncio.to_thread(get_tabel_ws)
+        await asyncio.to_thread(ws.append_rows, rows, value_input_option="USER_ENTERED")
+        await update.message.reply_text(
+            f"✅ Табель записан: строк {len(rows)}. Смотреть — в кабинете, раздел «Табель».")
+        return ConversationHandler.END
+    await update.message.reply_text("❌ Отменено, ничего не сохранено.")
+    return ConversationHandler.END
+
+
 async def photo_sale_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Доспрос банка после фото-реализации (безнал) — для финотчёта."""
     val = update.message.text.strip().lower()
@@ -1144,9 +1280,11 @@ async def detect_doc_type(image_bytes: bytes):
         "- РАСХОДНЫЙ ДОКУМЕНТ: платёжное поручение, счёт на оплату, чек, квитанция — компания "
         "ПЛАТИТ поставщику. Если плательщик — ТОО «Еділ и компания», это расход;\n"
         "- РАСЧЁТНАЯ ВЕДОМОСТЬ по заработной плате: список сотрудников с должностями, разделы "
-        "АУП и ПРОИЗВОДСТВО, колонка «перечислено в банк», итоги.\n"
+        "АУП и ПРОИЗВОДСТВО, колонка «перечислено в банк», итоги;\n"
+        "- ТАБЕЛЬ учёта рабочего времени: строки — сотрудники, колонки — дни месяца (1..31), "
+        "в ячейках часы или отметки выходов.\n"
         'Верни ТОЛЬКО JSON: {"тип":"реализация"} или {"тип":"производство"} или {"тип":"расход"} '
-        'или {"тип":"ведомость"}.'
+        'или {"тип":"ведомость"} или {"тип":"табель"}.'
     )
     try:
         res = await call_claude(image_b64, prompt)
@@ -1154,6 +1292,8 @@ async def detect_doc_type(image_bytes: bytes):
     except Exception as e:
         logger.error(f"detect_doc_type error: {e}")
         t = ""
+    if "табел" in t:
+        return "tabel"
     if "ведомост" in t:
         return "payroll"
     if "расход" in t:
@@ -1176,10 +1316,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         labels = {"sale": "📄 РЕАЛИЗАЦИЯ (накладная)",
                   "production": "📸 ПРОИЗВОДСТВО (отчёт)",
                   "expense": "💸 РАСХОД (платёжка / счёт / чек)",
-                  "payroll": "🧾 ВЕДОМОСТЬ ФОТ (зарплата)"}
+                  "payroll": "🧾 ВЕДОМОСТЬ ФОТ (зарплата)",
+                  "tabel": "📅 ТАБЕЛЬ (рабочее время)"}
         alt = {"sale": "🔁 Это реализация", "production": "🔁 Это производство",
-               "expense": "🔁 Это расход", "payroll": "🔁 Это ведомость ФОТ"}
-        others = [alt[k] for k in ("sale", "production", "expense", "payroll") if k != doc_type]
+               "expense": "🔁 Это расход", "payroll": "🔁 Это ведомость ФОТ",
+               "tabel": "🔁 Это табель"}
+        others = [alt[k] for k in ("sale", "production", "expense", "payroll", "tabel")
+                  if k != doc_type]
         label = labels[doc_type]
         kb = ReplyKeyboardMarkup([["✅ Да, верно"], others[:2], others[2:], ["❌ Отмена"]],
                                  resize_keyboard=True, one_time_keyboard=True)
@@ -1203,6 +1346,8 @@ async def photo_type_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
     if "да" in ans or "верно" in ans:
         photo_type = pending["type"]
+    elif "табел" in ans:
+        photo_type = "tabel"
     elif "ведомост" in ans:
         photo_type = "payroll"
     elif "расход" in ans:
@@ -1229,6 +1374,18 @@ async def photo_type_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def _dispatch_photo(update, context, photo_type, image_bytes):
     """Распознаёт и сохраняет фото по подтверждённому типу."""
     try:
+        if photo_type == "tabel":
+            await update.message.reply_text("📅 Распознаю табель...")
+            data = await recognize_tabel(image_bytes)
+            logger.info(f"Tabel data: {data}")
+            rawlist = data.get("сотрудники") if isinstance(data, dict) else None
+            if not rawlist:
+                await update.message.reply_text("❌ Не смог прочитать табель. Переснимай чётче.")
+                return ConversationHandler.END
+            context.user_data["pending_tabel_raw"] = rawlist
+            context.user_data["pending_tabel_period"] = _norm_period(str(data.get("месяц", "")))
+            return await _tabel_prepare(update, context)
+
         if photo_type == "payroll":
             await update.message.reply_text("🧾 Распознаю ведомость ФОТ...")
             data = await recognize_payroll(image_bytes)
@@ -2925,6 +3082,8 @@ def main():
             PAYROLL_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, payroll_date)],
             PAYROLL_BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, payroll_bank)],
             PAYROLL_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, payroll_confirm)],
+            TABEL_MONTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, tabel_month)],
+            TABEL_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, tabel_confirm)],
             **_exp_states(),  # фото-расход продолжает шаги расхода прямо здесь
         },
         fallbacks=[CommandHandler("cancel", cancel)],
