@@ -1159,14 +1159,16 @@ async def recognize_tabel(image_bytes: bytes):
     """Распознаёт табель: сотрудники × дни месяца, отработанные часы."""
     image_b64 = base64.b64encode(image_bytes).decode()
     prompt = (
-        "Это фото табеля учёта рабочего времени: строки — сотрудники, колонки — дни месяца "
-        "(1–31), в ячейках отработанные часы (число) или отметки (В=выходной, О=отпуск, "
-        "Б=больничный — такие дни пропускай).\n"
+        "Это фото табеля учёта рабочего времени ТОО «Еділ и компания» (может быть рукописный): "
+        "строки — сотрудники (бывает ДВЕ секции: завод и АУП — бери всех), колонки — дни месяца 1–31.\n"
+        "В ячейках: ЧИСЛО = отработанные часы (бывает 8, 10, 12); «в»=выходной, «п»=праздник, "
+        "«0»=не работал, «б/с»=отпуск без содержания, «отпуск», «больничный» — такие дни ПРОПУСКАЙ.\n"
         "Верни ТОЛЬКО JSON без markdown:\n"
         '{"месяц":"месяц и год из заголовка","сотрудники":[{"фио":"...","должность":"...",'
-        '"дни":{"1":8,"2":8}}]}\n'
-        "В «дни» включай ТОЛЬКО рабочие дни (ключ — номер дня, значение — часы). Если стоит "
-        "отметка выхода (Я, 1, +) без числа часов — ставь 8. Что не читается — пропусти."
+        '"дни":{"4":8,"5":10},"итого_часы":0,"итого_дни":0}]}\n'
+        "В «дни» включай ТОЛЬКО дни с числом часов (ключ — номер дня). итого_часы и итого_дни — "
+        "из колонок «часы»/«дни» справа, если они заполнены, иначе 0. Рукописные цифры читай "
+        "внимательно (10 и «в» не путать); что не читается — пропусти."
     )
     return await call_claude(image_b64, prompt)
 
@@ -1182,13 +1184,14 @@ async def _tabel_prepare(update, context):
         return TABEL_MONTH
     mon, year = nums
     have = await asyncio.to_thread(_tabel_existing, mon, year)
-    rows, skipped, hours, emps = [], 0, 0.0, set()
+    rows, skipped, hours, per = [], 0, 0.0, []
     for emp in rawlist:
         fio = str(emp.get("фио", "")).strip()
         if not fio:
             continue
         role = str(emp.get("должность", "")).strip()
         days = emp.get("дни") if isinstance(emp.get("дни"), dict) else {}
+        e_days, e_hours = 0, 0.0
         for dstr, h in days.items():
             try:
                 day = int(str(dstr).strip())
@@ -1197,12 +1200,20 @@ async def _tabel_prepare(update, context):
             hv = parse_num(h)
             if day < 1 or day > 31 or hv <= 0:
                 continue
+            e_days += 1
+            e_hours += hv  # всё распознанное — для сверки с колонкой «часы» бланка
             if (day, _fin_norm(fio)) in have:
                 skipped += 1
                 continue
-            emps.add(fio)
             hours += hv
             rows.append([f"{day:02d}.{mon:02d}.{year}", fio, role, hv, ""])
+        if not e_days:
+            continue
+        blank_h = parse_num(emp.get("итого_часы", 0))
+        mark = ""
+        if blank_h and round(blank_h) != round(e_hours):
+            mark = f" ⚠️ на бланке {round(blank_h)} ч — ПРОВЕРЬ!"
+        per.append(f"• {fio}: {e_days} дн / {round(e_hours)} ч{mark}")
     if not rows:
         if skipped:
             msg = f"📅 Табель за {period}: новых записей нет, всё уже внесено (пропущено {skipped})."
@@ -1218,9 +1229,9 @@ async def _tabel_prepare(update, context):
     kb = ReplyKeyboardMarkup([["✅ Да, сохранить"], ["❌ Отмена"]],
                              resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text(
-        f"📅 Табель за {period}:\n"
-        f"👥 Сотрудников: {len(emps)}\n"
-        f"🆕 Новых записей (человеко-дней): {len(rows)}\n"
+        f"📅 Табель за {period} — распознал по людям (сверь с бланком):\n"
+        + "\n".join(per) +
+        f"\n\n🆕 Новых записей (человеко-дней): {len(rows)}\n"
         f"⏱ Часов добавится: {round(hours)}{note}\n\nЗаписать в лист «Табель»?",
         reply_markup=kb)
     return TABEL_CONFIRM
