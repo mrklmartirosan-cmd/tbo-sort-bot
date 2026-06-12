@@ -80,6 +80,10 @@ RU_MONTHS = {
 (PAYROLL_DATE, PAYROLL_BANK, PAYROLL_CONFIRM) = range(40, 43)
 # NEW: табель учёта рабочего времени
 (TABEL_MONTH, TABEL_CONFIRM) = range(43, 45)
+# NEW: отметка смены кнопками (ежедневный табель без бумаги)
+(SM_DATE, SM_PICK, SM_HOURS, SM_CONFIRM) = range(45, 49)
+# NEW: комбинированный дневной отчёт (производство + кто работал)
+DAILY_CONFIRM = 49
 
 FRACTIONS = ["0-1", "1-2", "2-4", "4-6", "6-8"]
 
@@ -488,7 +492,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         ["📸 Производство", "📄 Реализация"],
         ["✍️ Ввод производства", "✍️ Ввод реализации"],
-        ["💸 Ввод расхода"],
+        ["💸 Ввод расхода", "👷 Смена"],
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text(
@@ -843,11 +847,13 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # «Спасательный круг»: кнопки главного меню (и «❌ Отмена») срабатывают ВСЕГДА,
 # даже посреди незаконченного ввода — сбрасывают его, чтобы бот не залипал.
-MENU_ESCAPE_RE = r"^(📸 Производство|📄 Реализация|✍️ Ввод производства|✍️ Ввод реализации|💸 Ввод расхода|❌ Отмена)$"
+MENU_ESCAPE_RE = r"^(📸 Производство|📄 Реализация|✍️ Ввод производства|✍️ Ввод реализации|💸 Ввод расхода|👷 Смена|❌ Отмена)$"
 
 
 async def conv_menu_escape(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    for k in ("prod", "sale", "exp", "pending_prod", "pending_sale", "pending_photo"):
+    for k in ("prod", "sale", "exp", "pending_prod", "pending_sale", "pending_photo",
+              "pending_payroll", "pending_tabel_raw", "pending_tabel_period",
+              "pending_tabel_rows", "pending_daily", "smena"):
         context.user_data.pop(k, None)
     if "Отмена" in update.message.text:
         await update.message.reply_text("❌ Отменено, ничего не сохранено.")
@@ -1254,10 +1260,223 @@ async def tabel_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ("да" in ans or "сохран" in ans) and rows:
         ws = await asyncio.to_thread(get_tabel_ws)
         await asyncio.to_thread(ws.append_rows, rows, value_input_option="USER_ENTERED")
+        try:
+            await asyncio.to_thread(_seed_employees, rows)
+        except Exception as e:
+            logger.error(f"seed employees error: {e}")
         await update.message.reply_text(
             f"✅ Табель записан: строк {len(rows)}. Смотреть — в кабинете, раздел «Табель».")
         return ConversationHandler.END
     await update.message.reply_text("❌ Отменено, ничего не сохранено.")
+    return ConversationHandler.END
+
+
+# ---------- Справочник «Сотрудники» + отметка смены кнопками ----------
+SHEET_EMPLOYEES = "Сотрудники"
+EMPLOYEE_HEADERS = ["Сотрудник", "Должность", "Активен"]
+
+
+def get_employees():
+    """Активные сотрудники из справочника: [(ФИО, должность), ...]."""
+    ws = get_worksheet(SHEET_EMPLOYEES, EMPLOYEE_HEADERS)
+    out = []
+    for row in ws.get_all_values()[1:]:
+        if len(row) < 3:
+            row = row + [""] * (3 - len(row))
+        fio = str(row[0]).strip()
+        if not fio:
+            continue
+        if str(row[2]).strip().lower() in ("нет", "0", "false", "уволен"):
+            continue
+        out.append((fio, str(row[1]).strip()))
+    return out
+
+
+def _seed_employees(tabel_rows):
+    """Дописывает в справочник сотрудников, встреченных в табеле, которых там ещё нет."""
+    ws = get_worksheet(SHEET_EMPLOYEES, EMPLOYEE_HEADERS)
+    known = {_fin_norm(r[0]) for r in ws.get_all_values()[1:] if r and str(r[0]).strip()}
+    new = []
+    seen = set()
+    for r in tabel_rows:
+        fio, role = str(r[1]).strip(), str(r[2]).strip()
+        key = _fin_norm(fio)
+        if not fio or key in known or key in seen:
+            continue
+        seen.add(key)
+        new.append([fio, role, "да"])
+    if new:
+        ws.append_rows(new, value_input_option="USER_ENTERED")
+
+
+async def recognize_daily(image_bytes: bytes):
+    """Распознаёт комбинированный дневной отчёт смены: производство + кто работал."""
+    image_b64 = base64.b64encode(image_bytes).decode()
+    prompt = (
+        "Это фото ЕЖЕДНЕВНОГО ОТЧЁТА СМЕНЫ ТОО «Еділ и компания»: сверху блок производства, "
+        "ниже таблица «Кто работал сегодня».\n"
+        "Верни ТОЛЬКО JSON без markdown:\n"
+        '{"дата":"дд.мм.гггг","производство":{"фио":"оператор/мастер","вес_шин":0,"нитки":0,'
+        '"фракция_0_1":0,"фракция_1_2":0,"фракция_2_4":0,"фракция_4_6":0,"фракция_6_8":0,'
+        '"всего_итог":0,"металл_корд":0,"примечание":""},'
+        '"работали":[{"фио":"...","должность":"...","часы":8}]}\n'
+        "Дата всегда дд.мм.гггг с точками (слитное «5626» = 05.06.2026). "
+        "У фракций две строки: «Мешки, шт» и «Крошка, кг» — в фракция_* бери строку КГ. "
+        "«всего_итог» — из строки «ВСЕГО крошки, кг». В «работали» — только заполненные строки "
+        "таблицы (часы числом: 8, 10, 12). Чего нет на бланке — 0 или пусто."
+    )
+    return await call_claude(image_b64, prompt)
+
+
+async def daily_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ans = update.message.text.strip().lower()
+    d = context.user_data.pop("pending_daily", None) or {}
+    if "да" not in ans and "сохран" not in ans:
+        await update.message.reply_text("❌ Отменено, ничего не сохранено.")
+        return ConversationHandler.END
+    saved_prod = False
+    if d.get("prod"):
+        await asyncio.to_thread(save_production, d["prod"])
+        saved_prod = True
+    rows = d.get("tabel") or []
+    if rows:
+        ws = await asyncio.to_thread(get_tabel_ws)
+        await asyncio.to_thread(ws.append_rows, rows, value_input_option="USER_ENTERED")
+        try:
+            await asyncio.to_thread(_seed_employees, rows)
+        except Exception as e:
+            logger.error(f"seed employees error: {e}")
+    if saved_prod:
+        schedule_refresh()
+    await update.message.reply_text(
+        f"✅ Дневной отчёт записан: производство — {'да' if saved_prod else 'нет'}, "
+        f"людей в табель — {len(rows)}. Остаток: /ostatok, табель — в кабинете.")
+    return ConversationHandler.END
+
+
+async def smena_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.message.reply_text("⛔ Нет доступа.")
+        return ConversationHandler.END
+    context.user_data["smena"] = {"выбрано": {}}
+    kb = ReplyKeyboardMarkup([["Сегодня"], ["❌ Отмена"]],
+                             resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text(
+        "👷 Отмечаем смену. За какую дату? Нажми «Сегодня» или введи дд.мм.гггг.",
+        reply_markup=kb)
+    return SM_DATE
+
+
+async def smena_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip().lower()
+    d = context.user_data.setdefault("smena", {"выбрано": {}})
+    if "сегодня" in t:
+        d["дата"] = datetime.now().strftime("%d.%m.%Y")
+    else:
+        dt = parse_date_or_none(t)
+        if dt is None:
+            await update.message.reply_text("⚠️ Не понял дату. «Сегодня» или дд.мм.гггг.")
+            return SM_DATE
+        d["дата"] = date_to_str(dt)
+    emps = await asyncio.to_thread(get_employees)
+    if not emps:
+        await update.message.reply_text(
+            "📋 Справочник «Сотрудники» пуст. Заполни лист «Сотрудники» в таблице склада "
+            "(ФИО, должность) или пришли фото табеля — я добавлю людей оттуда сам.")
+        context.user_data.pop("smena", None)
+        return ConversationHandler.END
+    d["сотрудники"] = emps
+    return await _smena_show(update, context)
+
+
+async def _smena_show(update, context):
+    d = context.user_data.get("smena", {})
+    rows = []
+    for fio, _role in d.get("сотрудники", []):
+        sel = d["выбрано"].get(fio)
+        rows.append([("✔ " if sel else "") + fio + (f" ({sel:g} ч)" if sel else "")])
+    rows.append(["✅ Готово", "❌ Отмена"])
+    kb = ReplyKeyboardMarkup(rows, resize_keyboard=True)
+    await update.message.reply_text(
+        f"📅 Смена за {d.get('дата', '—')}. Отмечай, кто работал (повторное нажатие — убрать). "
+        f"Выбрано: {len(d['выбрано'])}. Когда всё — «✅ Готово».",
+        reply_markup=kb)
+    return SM_PICK
+
+
+async def smena_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    d = context.user_data.get("smena")
+    if not d:
+        await update.message.reply_text("Нажми «👷 Смена» заново.")
+        return ConversationHandler.END
+    if t.startswith("✅") or "готово" in t.lower():
+        if not d["выбрано"]:
+            await update.message.reply_text("⚠️ Никто не отмечен. Выбери хотя бы одного или «❌ Отмена».")
+            return SM_PICK
+        lines = "\n".join(f"• {f}: {h:g} ч" for f, h in d["выбрано"].items())
+        kb = ReplyKeyboardMarkup([["✅ Да, сохранить"], ["⬅️ Назад", "❌ Отмена"]],
+                                 resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text(
+            f"Проверь смену за {d['дата']}:\n{lines}\n\nЗаписать в «Табель»?", reply_markup=kb)
+        return SM_CONFIRM
+    name = t.lstrip("✔").strip().split(" (")[0]
+    match = next((f for f, _r in d.get("сотрудники", []) if f == name), None)
+    if match is None:
+        await update.message.reply_text("⚠️ Выбери сотрудника кнопкой из списка.")
+        return SM_PICK
+    if match in d["выбрано"]:
+        d["выбрано"].pop(match)
+        return await _smena_show(update, context)
+    d["_тек"] = match
+    kb = ReplyKeyboardMarkup([["8", "10", "12"], ["⬅️ Назад"]],
+                             resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text(f"⏱ Сколько часов отработал {match}?", reply_markup=kb)
+    return SM_HOURS
+
+
+async def smena_hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    d = context.user_data.get("smena", {})
+    if "назад" in t.lower():
+        d.pop("_тек", None)
+        return await _smena_show(update, context)
+    hv = parse_num(t)
+    if hv <= 0 or hv > 24:
+        await update.message.reply_text("⚠️ Введи часы числом (1–24) или кнопкой.")
+        return SM_HOURS
+    fio = d.pop("_тек", None)
+    if fio:
+        d["выбрано"][fio] = hv
+    return await _smena_show(update, context)
+
+
+async def smena_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ans = update.message.text.strip().lower()
+    d = context.user_data.get("smena", {})
+    if "назад" in ans:
+        return await _smena_show(update, context)
+    if "да" not in ans and "сохран" not in ans:
+        context.user_data.pop("smena", None)
+        await update.message.reply_text("❌ Отменено, ничего не сохранено.")
+        return ConversationHandler.END
+    dt = parse_date_or_none(d.get("дата", ""))
+    roles = dict(d.get("сотрудники", []))
+    have = await asyncio.to_thread(_tabel_existing, dt.month, dt.year) if dt else set()
+    rows, dups = [], []
+    for fio, hv in d.get("выбрано", {}).items():
+        if dt and (dt.day, _fin_norm(fio)) in have:
+            dups.append(fio)
+            continue
+        rows.append([d["дата"], fio, roles.get(fio, ""), hv, "смена (бот)"])
+    context.user_data.pop("smena", None)
+    if rows:
+        ws = await asyncio.to_thread(get_tabel_ws)
+        await asyncio.to_thread(ws.append_rows, rows, value_input_option="USER_ENTERED")
+    note = f"\n♻️ Уже были отмечены (пропустил): {', '.join(dups)}" if dups else ""
+    await update.message.reply_text(
+        f"✅ Смена за {d.get('дата', '—')} записана: {len(rows)} чел.{note}\n"
+        f"Смотреть — в кабинете, раздел «Табель».")
     return ConversationHandler.END
 
 
@@ -1293,9 +1512,12 @@ async def detect_doc_type(image_bytes: bytes):
         "- РАСЧЁТНАЯ ВЕДОМОСТЬ по заработной плате: список сотрудников с должностями, разделы "
         "АУП и ПРОИЗВОДСТВО, колонка «перечислено в банк», итоги;\n"
         "- ТАБЕЛЬ учёта рабочего времени: строки — сотрудники, колонки — дни месяца (1..31), "
-        "в ячейках часы или отметки выходов.\n"
+        "в ячейках часы или отметки выходов;\n"
+        "- ДНЕВНОЙ ОТЧЁТ СМЕНЫ (комбинированный): блок производства И ОТДЕЛЬНАЯ таблица "
+        "«Кто работал сегодня» (ФИО, должность, часы, подпись). Если таблицы работавших НЕТ — "
+        "это просто отчёт производства.\n"
         'Верни ТОЛЬКО JSON: {"тип":"реализация"} или {"тип":"производство"} или {"тип":"расход"} '
-        'или {"тип":"ведомость"} или {"тип":"табель"}.'
+        'или {"тип":"ведомость"} или {"тип":"табель"} или {"тип":"дневной"}.'
     )
     try:
         res = await call_claude(image_b64, prompt)
@@ -1303,6 +1525,8 @@ async def detect_doc_type(image_bytes: bytes):
     except Exception as e:
         logger.error(f"detect_doc_type error: {e}")
         t = ""
+    if "дневн" in t:
+        return "daily"
     if "табел" in t:
         return "tabel"
     if "ведомост" in t:
@@ -1328,15 +1552,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                   "production": "📸 ПРОИЗВОДСТВО (отчёт)",
                   "expense": "💸 РАСХОД (платёжка / счёт / чек)",
                   "payroll": "🧾 ВЕДОМОСТЬ ФОТ (зарплата)",
-                  "tabel": "📅 ТАБЕЛЬ (рабочее время)"}
+                  "tabel": "📅 ТАБЕЛЬ (рабочее время)",
+                  "daily": "📋 ДНЕВНОЙ ОТЧЁТ (производство + люди)"}
         alt = {"sale": "🔁 Это реализация", "production": "🔁 Это производство",
                "expense": "🔁 Это расход", "payroll": "🔁 Это ведомость ФОТ",
-               "tabel": "🔁 Это табель"}
-        others = [alt[k] for k in ("sale", "production", "expense", "payroll", "tabel")
+               "tabel": "🔁 Это табель", "daily": "🔁 Это дневной отчёт"}
+        others = [alt[k] for k in ("sale", "production", "expense", "payroll", "tabel", "daily")
                   if k != doc_type]
+        kb_rows = [["✅ Да, верно"]] + [others[i:i + 2] for i in range(0, len(others), 2)] + [["❌ Отмена"]]
         label = labels[doc_type]
-        kb = ReplyKeyboardMarkup([["✅ Да, верно"], others[:2], others[2:], ["❌ Отмена"]],
-                                 resize_keyboard=True, one_time_keyboard=True)
+        kb = ReplyKeyboardMarkup(kb_rows, resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text(
             f"Определил: {label}\n\nВерно? Подтверди — распознаю и сохраню.",
             reply_markup=kb,
@@ -1357,6 +1582,8 @@ async def photo_type_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
     if "да" in ans or "верно" in ans:
         photo_type = pending["type"]
+    elif "дневн" in ans:
+        photo_type = "daily"
     elif "табел" in ans:
         photo_type = "tabel"
     elif "ведомост" in ans:
@@ -1385,6 +1612,68 @@ async def photo_type_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def _dispatch_photo(update, context, photo_type, image_bytes):
     """Распознаёт и сохраняет фото по подтверждённому типу."""
     try:
+        if photo_type == "daily":
+            await update.message.reply_text("📋 Распознаю дневной отчёт смены...")
+            data = await recognize_daily(image_bytes)
+            logger.info(f"Daily data: {data}")
+            workers = data.get("работали") if isinstance(data, dict) else None
+            if not workers:
+                # таблицы «кто работал» нет — обрабатываем как обычный отчёт производства
+                return await _dispatch_photo(update, context, "production", image_bytes)
+            dt = parse_date_or_none(str(data.get("дата", "")))
+            if dt is None:
+                await update.message.reply_text(
+                    "⚠️ Не смог уверенно прочитать ДАТУ на дневном отчёте. Переснимай чётче "
+                    "(дата с точками: 12.06.2026). Ничего не записал.")
+                return ConversationHandler.END
+            prod = data.get("производство") if isinstance(data.get("производство"), dict) else {}
+            prod["дата"] = date_to_str(dt)
+            calc = sum(parse_num(prod.get(fk, 0)) for fk in
+                       ("фракция_0_1", "фракция_1_2", "фракция_2_4", "фракция_4_6", "фракция_6_8"))
+            written = parse_num(prod.get("всего_итог", 0))
+            if written and abs(calc - written) > 1:
+                await update.message.reply_text(
+                    f"⚠️ Расхождение по крошке: на бланке «всего» {written:.0f} кг, по фракциям "
+                    f"{calc:.0f} кг. Проверь фото или внеси вручную. Ничего не записал.")
+                return ConversationHandler.END
+            has_prod = calc > 0 or parse_num(prod.get("вес_шин", 0)) > 0
+            dup_note = ""
+            if has_prod:
+                try:
+                    if find_duplicate_production(prod):
+                        dup_note = "\n⚠️ Похоже, производство за эту дату уже есть в складе — проверь, не дубль ли!"
+                except Exception as e:
+                    logger.error(f"daily dup check error: {e}")
+            have = await asyncio.to_thread(_tabel_existing, dt.month, dt.year)
+            t_rows, dups = [], []
+            for w in workers:
+                fio = str(w.get("фио", "")).strip()
+                if not fio:
+                    continue
+                hv = parse_num(w.get("часы", 0)) or 8
+                if (dt.day, _fin_norm(fio)) in have:
+                    dups.append(fio)
+                    continue
+                t_rows.append([date_to_str(dt), fio, str(w.get("должность", "")).strip(),
+                               hv, "дневной отчёт"])
+            lines = "\n".join(f"• {r[1]}: {r[3]:g} ч" for r in t_rows) or "— (все уже отмечены)"
+            skip = f"\n♻️ Уже отмечены (пропущу): {', '.join(dups)}" if dups else ""
+            prod_line = (f"🏭 Производство: шин {parse_num(prod.get('вес_шин', 0)):.0f} кг, "
+                         f"крошки {calc:.0f} кг, металлокорд {parse_num(prod.get('металл_корд', 0)):.0f} кг"
+                         if has_prod else "🏭 Производство: блок пуст — запишу только людей")
+            if not has_prod and not t_rows:
+                await update.message.reply_text(
+                    "📋 На дневном отчёте не нашёл ни производства, ни новых людей. Ничего не записал." + skip)
+                return ConversationHandler.END
+            context.user_data["pending_daily"] = {"prod": prod if has_prod else None, "tabel": t_rows}
+            kb = ReplyKeyboardMarkup([["✅ Да, сохранить"], ["❌ Отмена"]],
+                                     resize_keyboard=True, one_time_keyboard=True)
+            await update.message.reply_text(
+                f"📋 Дневной отчёт за {date_to_str(dt)}:\n{prod_line}{dup_note}\n\n"
+                f"👷 Работали:\n{lines}{skip}\n\nЗаписать?",
+                reply_markup=kb)
+            return DAILY_CONFIRM
+
         if photo_type == "tabel":
             await update.message.reply_text("📅 Распознаю табель...")
             data = await recognize_tabel(image_bytes)
@@ -3095,6 +3384,7 @@ def main():
             PAYROLL_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, payroll_confirm)],
             TABEL_MONTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, tabel_month)],
             TABEL_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, tabel_confirm)],
+            DAILY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, daily_confirm)],
             **_exp_states(),  # фото-расход продолжает шаги расхода прямо здесь
         },
         fallbacks=[CommandHandler("cancel", cancel)],
@@ -3114,16 +3404,28 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    smena_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^👷 Смена$"), smena_start)],
+        states={
+            SM_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, smena_date)],
+            SM_PICK: [MessageHandler(filters.TEXT & ~filters.COMMAND, smena_pick)],
+            SM_HOURS: [MessageHandler(filters.TEXT & ~filters.COMMAND, smena_hours)],
+            SM_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, smena_confirm)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     # «Спасательный круг»: в каждом шаге каждого диалога кнопки меню и «❌ Отмена»
     # обрабатываются первыми — незаконченный ввод сбрасывается, бот не залипает.
     _escape = MessageHandler(filters.Regex(MENU_ESCAPE_RE), conv_menu_escape)
-    for _conv in (prod_conv, sale_conv, exp_conv, photo_conv):
+    for _conv in (prod_conv, sale_conv, exp_conv, photo_conv, smena_conv):
         for _handlers in _conv.states.values():
             _handlers.insert(0, _escape)
 
     app.add_handler(prod_conv)
     app.add_handler(sale_conv)
     app.add_handler(exp_conv)
+    app.add_handler(smena_conv)
     app.add_handler(photo_conv)  # после exp_conv: фото в режиме «Ввод расхода» ловит exp_conv
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
