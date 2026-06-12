@@ -84,6 +84,8 @@ RU_MONTHS = {
 (SM_DATE, SM_PICK, SM_HOURS, SM_CONFIRM) = range(45, 49)
 # NEW: комбинированный дневной отчёт (производство + кто работал)
 DAILY_CONFIRM = 49
+# NEW: Excel-выписка входящих платежей (переводы между компаниями группы)
+(VYP_BANK, VYP_CONFIRM) = range(50, 52)
 
 FRACTIONS = ["0-1", "1-2", "2-4", "4-6", "6-8"]
 
@@ -853,7 +855,7 @@ MENU_ESCAPE_RE = r"^(📸 Производство|📄 Реализация|✍
 async def conv_menu_escape(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for k in ("prod", "sale", "exp", "pending_prod", "pending_sale", "pending_photo",
               "pending_payroll", "pending_tabel_raw", "pending_tabel_period",
-              "pending_tabel_rows", "pending_daily", "smena"):
+              "pending_tabel_rows", "pending_daily", "pending_vyp", "smena"):
         context.user_data.pop(k, None)
     if "Отмена" in update.message.text:
         await update.message.reply_text("❌ Отменено, ничего не сохранено.")
@@ -1307,6 +1309,254 @@ def _seed_employees(tabel_rows):
         new.append([fio, role, "да"])
     if new:
         ws.append_rows(new, value_input_option="USER_ENTERED")
+
+
+# ---------- Excel-выписка входящих платежей: переводы между компаниями группы ----------
+SHEET_GROUP = "Группа компаний"
+GROUP_HEADERS = ["Компания", "БИН", "Метка в отчёте"]
+SHEET_INCOME = "Поступления"
+INCOME_HEADERS = ["Дата", "Плательщик", "Сумма", "Банк", "Тип", "Назначение", "БИН"]
+SHEET_ACCOUNTS = "Счета"
+ACCOUNTS_HEADERS = ["Счёт", "Банк"]
+GROUP_SEED = [
+    ["ТОО L-Trading", "", "ТОО L-Trading"],
+    ["ТОО SPECO", "", "ТОО SPECO"],
+    ["ТОО Black Friday", "", "ТОО Black Friday"],
+    ["ТОО Рудный-АБАТ-2006", "", "ТОО Рудный-АБАТ-2006"],
+    ["ТОО Рудный-Тазалык-2006", "", "ТОО Рудный-Тазалык-2006 (предоплата за товар)"],
+]
+
+
+def _norm_company(s):
+    """'ТОО \"L-TRADING\"' -> 'ltrading' — для сравнения названий компаний."""
+    s = str(s).lower()
+    s = re.sub(r"[\"'«»“”]", "", s)
+    s = re.sub(r"\b(тоо|ао|ип|оао|зао|ооо|llp|llc)\b", "", s)
+    return re.sub(r"[^a-zа-я0-9ёі]", "", s)
+
+
+def get_group_companies():
+    """Справочник компаний группы. Пустой лист заполняется стартовой пятёркой."""
+    ws = get_worksheet(SHEET_GROUP, GROUP_HEADERS)
+    rows = ws.get_all_values()[1:]
+    if not any(r and str(r[0]).strip() for r in rows):
+        ws.append_rows(GROUP_SEED, value_input_option="USER_ENTERED")
+        rows = GROUP_SEED
+    out = []
+    for r in rows:
+        r = list(r) + [""] * (3 - len(r))
+        name = str(r[0]).strip()
+        if name:
+            out.append({"name": name, "bin": re.sub(r"\D", "", str(r[1])),
+                        "label": str(r[2]).strip() or name})
+    return out
+
+
+def _match_group(payer, payer_bin, comps):
+    """Компания группы по БИН (приоритет) или нормализованному названию."""
+    for c in comps:
+        if payer_bin and c["bin"] and payer_bin == c["bin"]:
+            return c
+    pn = _norm_company(payer)
+    if not pn:
+        return None
+    for c in comps:
+        if pn == _norm_company(c["name"]):
+            return c
+    return None
+
+
+def get_accounts():
+    """Наши счета: {IBAN: банк}."""
+    out = {}
+    for r in get_worksheet(SHEET_ACCOUNTS, ACCOUNTS_HEADERS).get_all_values()[1:]:
+        if len(r) >= 2 and str(r[0]).strip():
+            out[str(r[0]).strip().upper()] = str(r[1]).strip()
+    return out
+
+
+def add_account(acc, bank):
+    get_worksheet(SHEET_ACCOUNTS, ACCOUNTS_HEADERS).append_row(
+        [acc, bank], value_input_option="USER_ENTERED")
+
+
+def _income_existing():
+    """Ключи (дата, плательщик, сумма) уже внесённых поступлений — дедуп повторных выписок."""
+    have = set()
+    try:
+        for r in get_worksheet(SHEET_INCOME, INCOME_HEADERS).get_all_values()[1:]:
+            if len(r) < 3:
+                continue
+            dt = parse_date_or_none(r[0])
+            have.add((date_to_str(dt) if dt else str(r[0]).strip(),
+                      _norm_company(r[1]), round(parse_num(r[2]), 2)))
+    except Exception as e:
+        logger.error(f"income read error: {e}")
+    return have
+
+
+def _parse_bank_xlsx(content):
+    """Разбирает банковскую выписку входящих платежей (xlsx). None — формат не распознан."""
+    wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
+    ws = wb.worksheets[0]
+    rows = [[("" if c.value is None else c.value) for c in row] for row in ws.iter_rows()]
+    hdr_i, cols = None, {}
+    for i, r in enumerate(rows[:10]):
+        low = [str(v).strip().lower() for v in r]
+        if any(v.startswith("плательщик") for v in low) and any("сумма" in v for v in low):
+            hdr_i = i
+            for j, v in enumerate(low):
+                if v == "дата":
+                    cols["дата"] = j
+                elif v.startswith("плательщик") and "бин" not in v and "счет" not in v and "счёт" not in v:
+                    cols["плательщик"] = j
+                elif v.startswith("сумма"):
+                    cols["сумма"] = j
+                elif "счет получателя" in v or "счёт получателя" in v:
+                    cols["счёт"] = j
+                elif "назначение" in v:
+                    cols["назначение"] = j
+                elif ("бин" in v or "иин" in v) and "бин" not in cols:
+                    cols["бин"] = j
+            break
+    if hdr_i is None or "плательщик" not in cols or "сумма" not in cols:
+        return None
+    out = []
+    for r in rows[hdr_i + 1:]:
+        def gv(k):
+            j = cols.get(k)
+            return r[j] if j is not None and len(r) > j else ""
+        payer = str(gv("плательщик")).strip()
+        s = parse_num(gv("сумма"))
+        if not payer or not s:
+            continue
+        dtv = gv("дата")
+        dt = dtv if isinstance(dtv, datetime) else parse_date_or_none(str(dtv).split()[0] if dtv else "")
+        out.append({
+            "дата": date_to_str(dt) if dt else "",
+            "плательщик": payer,
+            "сумма": s,
+            "счёт": str(gv("счёт")).strip().upper(),
+            "назначение": str(gv("назначение")).strip()[:120],
+            "бин": re.sub(r"\D", "", str(gv("бин"))),
+        })
+    return out
+
+
+async def handle_xlsx(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Excel-файл в чате: выписка входящих платежей → переводы группы в «Поступления»."""
+    if not is_allowed(update):
+        await update.message.reply_text("⛔ Нет доступа.")
+        return ConversationHandler.END
+    await update.message.reply_text("📑 Получил Excel, разбираю...")
+    try:
+        doc = update.message.document
+        f = await context.bot.get_file(doc.file_id)
+        content = bytes(await f.download_as_bytearray())
+        rows = await asyncio.to_thread(_parse_bank_xlsx, content)
+    except Exception as e:
+        logger.error(f"xlsx parse error: {e}")
+        await update.message.reply_text(f"❌ Не смог разобрать файл: {e}")
+        return ConversationHandler.END
+    if rows is None:
+        await update.message.reply_text(
+            "❌ Не нашёл колонки банковской выписки (Плательщик, Сумма, Дата...). "
+            "Пока умею только выписку входящих платежей.")
+        return ConversationHandler.END
+    comps = await asyncio.to_thread(get_group_companies)
+    have = await asyncio.to_thread(_income_existing)
+    group_rows, other, dups = [], set(), 0
+    for r in rows:
+        comp = _match_group(r["плательщик"], r["бин"], comps)
+        if comp is None:
+            other.add(r["плательщик"])
+            continue
+        if (r["дата"], _norm_company(r["плательщик"]), round(r["сумма"], 2)) in have:
+            dups += 1
+            continue
+        r["метка"] = comp["label"]
+        group_rows.append(r)
+    if not group_rows:
+        msg = "📑 Новых переводов группы в файле нет."
+        if dups:
+            msg += f"\n♻️ Уже внесено ранее: {dups}."
+        if other:
+            msg += "\n⏭ Не из группы (пропустил): " + ", ".join(sorted(other)[:5])
+        await update.message.reply_text(msg)
+        return ConversationHandler.END
+    accounts = await asyncio.to_thread(get_accounts)
+    unknown = sorted({r["счёт"] for r in group_rows if r["счёт"] and r["счёт"] not in accounts})
+    context.user_data["pending_vyp"] = {"rows": group_rows, "accounts": accounts,
+                                        "unknown": unknown, "dups": dups,
+                                        "other": sorted(other)}
+    if unknown:
+        kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["❌ Отмена"]],
+                                 resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text(
+            f"🏦 Незнакомый счёт получателя:\n{unknown[0]}\nЭто какой наш банк? (запомню навсегда)",
+            reply_markup=kb)
+        return VYP_BANK
+    return await _vyp_confirm_ask(update, context)
+
+
+async def vyp_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    val = update.message.text.strip().lower()
+    if "евраз" in val:
+        bank = "Евразийский"
+    elif "бцк" in val or "bcc" in val:
+        bank = "БЦК"
+    else:
+        await update.message.reply_text("⚠️ Выбери: Евразийский или БЦК")
+        return VYP_BANK
+    d = context.user_data.get("pending_vyp", {})
+    acc = d["unknown"].pop(0)
+    await asyncio.to_thread(add_account, acc, bank)
+    d["accounts"][acc] = bank
+    if d["unknown"]:
+        kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["❌ Отмена"]],
+                                 resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text(
+            f"🏦 Ещё счёт:\n{d['unknown'][0]}\nКакой банк?", reply_markup=kb)
+        return VYP_BANK
+    return await _vyp_confirm_ask(update, context)
+
+
+async def _vyp_confirm_ask(update, context):
+    d = context.user_data.get("pending_vyp", {})
+    lines = "\n".join(
+        f"• {r['дата']} — {r['метка']}: {round(r['сумма'])} тнг "
+        f"({d['accounts'].get(r['счёт'], '—')})" for r in d.get("rows", []))
+    total = sum(r["сумма"] for r in d.get("rows", []))
+    extra = ""
+    if d.get("dups"):
+        extra += f"\n♻️ Уже внесено ранее (пропущу): {d['dups']}"
+    if d.get("other"):
+        extra += "\n⏭ Не из группы (пропущу): " + ", ".join(d["other"][:5])
+    kb = ReplyKeyboardMarkup([["✅ Да, сохранить"], ["❌ Отмена"]],
+                             resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text(
+        f"📑 Переводы между компаниями группы:\n{lines}\n"
+        f"💰 Итого добавится: {round(total)} тнг{extra}\n\nЗаписать?",
+        reply_markup=kb)
+    return VYP_CONFIRM
+
+
+async def vyp_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ans = update.message.text.strip().lower()
+    d = context.user_data.pop("pending_vyp", None) or {}
+    if "да" not in ans and "сохран" not in ans:
+        await update.message.reply_text("❌ Отменено, ничего не сохранено.")
+        return ConversationHandler.END
+    out = [[r["дата"], r["плательщик"], r["сумма"],
+            d["accounts"].get(r["счёт"], ""), "Перевод группы",
+            r["назначение"], r["бин"]] for r in d.get("rows", [])]
+    ws = await asyncio.to_thread(get_worksheet, SHEET_INCOME, INCOME_HEADERS)
+    await asyncio.to_thread(ws.append_rows, out, value_input_option="USER_ENTERED")
+    schedule_refresh()
+    await update.message.reply_text(
+        f"✅ Записано переводов группы: {len(out)}. Финотчёт обновится сам "
+        f"(блок «Переводы между компаниями группы»).")
+    return ConversationHandler.END
 
 
 async def recognize_daily(image_bytes: bytes):
@@ -2814,7 +3064,33 @@ def _fin_collect(month):
         elif src in ("Касса 1", "Касса 2"):
             name = cat + (f" ({agent})" if agent else "")
             cash[src][name] = cash[src].get(name, 0) + s
-    return inc, cashless, cash, salary, fot_tax
+    # переводы между компаниями группы — из листа «Поступления» (грузится Excel-выпиской)
+    transfers = {}
+    try:
+        comps = get_group_companies()
+        for row in skl.worksheet(SHEET_INCOME).get_all_values()[1:]:
+            if len(row) < 5:
+                row = row + [""] * (5 - len(row))
+            dt = parse_date_or_none(row[0])
+            if not dt or dt.year != year or dt.month != month:
+                continue
+            if not str(row[4]).strip().lower().startswith("перевод"):
+                continue
+            s = parse_num(row[2])
+            if not s:
+                continue
+            bank = str(row[3]).strip()
+            if bank not in FIN_BANKS:
+                bank = "Евразийский"
+            comp = _match_group(row[1], re.sub(r"\D", "", str(row[6])) if len(row) > 6 else "", comps)
+            label = comp["label"] if comp else str(row[1]).strip()
+            d3 = transfers.setdefault(label, {b: 0.0 for b in FIN_BANKS})
+            d3[bank] += s
+    except gspread.WorksheetNotFound:
+        pass
+    except Exception as e:
+        logger.error(f"transfers collect error: {e}")
+    return inc, cashless, cash, salary, fot_tax, transfers
 
 
 def _fin_find(grid, needle, start=0, end=None):
@@ -2884,7 +3160,7 @@ def _fin_write_group_leaves(book, ws, grid, gi, items):
 
 def _fill_fin(month):
     """Заполняет вкладку месяца в финотчёте. Возвращает текст-сводку."""
-    inc, cashless, cash, salary, fot_tax = _fin_collect(month)
+    inc, cashless, cash, salary, fot_tax, transfers = _fin_collect(month)
     book = _get_client().open_by_key(SEBES_FILE_ID)
     name = RU_MONTHS_FULL[month]
     year = datetime.now().year
@@ -3009,7 +3285,15 @@ def _fill_fin(month):
                        key=lambda kv: -(kv[1]["Евразийский"] + kv[1]["БЦК"]))
         _fin_write_group_leaves(book, ws, grid, gi, items)
 
-    # 4) Юр.лица: раскладываем по ПОКУПАТЕЛЯМ (кто сколько оплатил) — в самом конце,
+    # 4) переводы между компаниями группы (из Excel-выписок) — если данные есть
+    if transfers:
+        gi = _fin_find(grid, "переводы между", 0, i_rash)
+        if gi is not None:
+            items = sorted(transfers.items(),
+                           key=lambda kv: -(kv[1]["Евразийский"] + kv[1]["БЦК"]))
+            _fin_write_group_leaves(book, ws, grid, gi, items)
+
+    # 5) Юр.лица: раскладываем по ПОКУПАТЕЛЯМ (кто сколько оплатил) — в самом конце,
     # т.к. вставка строк вверху сдвигает всё ниже (уже записанное переедет вместе со строками)
     gi = _fin_find(grid, "юр", 0, i_rash)
     if gi is not None:
@@ -3030,8 +3314,10 @@ def _fill_fin(month):
     extra = (" (" + ", ".join(notes) + ")") if notes else ""
     t_sal = sum(salary.values())
     t_tax = sum(sum(v.values()) for v in fot_tax.values())
+    t_tr = sum(sum(v.values()) for v in transfers.values())
     return (f"✅ Финотчёт: вкладка «{name}» заполнена{extra}.\n\n"
             f"💰 Безнал-поступления (продажи): {round(t_inc)} тнг\n"
+            f"🔁 Переводы группы: {round(t_tr)} тнг\n"
             f"💸 Безнал-расходы (группы бота): {round(t_out)} тнг\n"
             f"👥 Зарплата на карты (ФОТ): {round(t_sal)} тнг\n"
             f"🧾 Налоги ФОТ (оплачено): {round(t_tax)} тнг\n"
@@ -3419,6 +3705,15 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    xlsx_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Document.FileExtension("xlsx"), handle_xlsx)],
+        states={
+            VYP_BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, vyp_bank)],
+            VYP_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, vyp_confirm)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     smena_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^👷 Смена$"), smena_start)],
         states={
@@ -3433,7 +3728,7 @@ def main():
     # «Спасательный круг»: в каждом шаге каждого диалога кнопки меню и «❌ Отмена»
     # обрабатываются первыми — незаконченный ввод сбрасывается, бот не залипает.
     _escape = MessageHandler(filters.Regex(MENU_ESCAPE_RE), conv_menu_escape)
-    for _conv in (prod_conv, sale_conv, exp_conv, photo_conv, smena_conv):
+    for _conv in (prod_conv, sale_conv, exp_conv, photo_conv, smena_conv, xlsx_conv):
         for _handlers in _conv.states.values():
             _handlers.insert(0, _escape)
 
@@ -3441,6 +3736,7 @@ def main():
     app.add_handler(sale_conv)
     app.add_handler(exp_conv)
     app.add_handler(smena_conv)
+    app.add_handler(xlsx_conv)
     app.add_handler(photo_conv)  # после exp_conv: фото в режиме «Ввод расхода» ловит exp_conv
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
