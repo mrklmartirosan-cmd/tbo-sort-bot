@@ -1319,7 +1319,7 @@ INCOME_HEADERS = ["Дата", "Плательщик", "Сумма", "Банк", 
 SHEET_ACCOUNTS = "Счета"
 ACCOUNTS_HEADERS = ["Счёт", "Банк"]
 GROUP_SEED = [
-    ["ТОО L-Trading", "", "ТОО L-Trading"],
+    ["ТОО L-Trading", "140740018655", "ТОО L-Trading"],
     ["ТОО SPECO", "", "ТОО SPECO"],
     ["ТОО Black Friday", "", "ТОО Black Friday"],
     ["ТОО Рудный-АБАТ-2006", "", "ТОО Рудный-АБАТ-2006"],
