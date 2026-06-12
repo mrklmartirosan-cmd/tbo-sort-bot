@@ -3438,10 +3438,12 @@ def _fill_reports(month):
     for needle, num in (("доля фот", rf), ("доля лизинга", rl)):
         di = _fin_find(vg, needle)
         if di is not None and num and ri:
+            # IFERROR с одним аргументом — без разделителя аргументов,
+            # иначе в русской локали запятая ломает формулу (#ERROR!)
             ups.append({"range": f"{col}{di + 1}",
-                        "values": [[f"=IFERROR({col}{num}/{col}{ri},0)"]]})
+                        "values": [[f"=IFERROR({col}{num}/{col}{ri})"]]})
             ups.append({"range": f"{itog}{di + 1}",
-                        "values": [[f"=IFERROR({itog}{num}/{itog}{ri},0)"]]})
+                        "values": [[f"=IFERROR({itog}{num}/{itog}{ri})"]]})
     ups.append({"range": "A1", "values": [[
         f'ТОО "Едiл и компания" — сводка и выводы за январь–{name} {year} г. (тенге)']]})
     ups.append({"range": f"{itog}2", "values": [[f"Итого {n_mon} мес"]]})
