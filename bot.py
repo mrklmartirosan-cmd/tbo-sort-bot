@@ -14,34 +14,27 @@ from telegram.ext import (
 import httpx
 import gspread
 import openpyxl
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 PORT = int(os.environ.get("PORT", 8080))
-
 # --- Google Sheets ---
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
 REPORT_SPREADSHEET_ID = os.environ.get("REPORT_SPREADSHEET_ID", "")  # файл "Реализация 2026г"
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")  # содержимое JSON-ключа целиком
-
 SHEET_PRODUCTION = "Производство"
 SHEET_SALES = "Реализация"
-
 # Список разрешённых Telegram ID (закрытый доступ).
 # Пустой список = пускать всех (страховка, чтобы не заблокировать себя).
 _allowed_raw = os.environ.get("ALLOWED_USERS", "")
 ALLOWED_USERS = {int(x) for x in _allowed_raw.replace(" ", "").split(",") if x.strip().isdigit()}
-
 # --- Автобэкап ---
 BACKUP_CHANNEL_ID = os.environ.get("BACKUP_CHANNEL_ID", "")
 KZ_TZ = timezone(timedelta(hours=5))
 BACKUP_HOUR = 22
 _last_backup_counts = {}
-
 # --- настройки отчёта реализации ---------------------------------
 REPORT_TEMPLATE = "ШАБЛОН"                 # лист-образец (пустой бланк)
 REPORT_DATE_COL = 2                        # B = Дата
@@ -64,7 +57,6 @@ RU_MONTHS = {
     7: "июль", 8: "август", 9: "сентябрь", 10: "октябрь", 11: "ноябрь", 12: "декабрь",
 }
 # ------------------------------------------------------------------
-
 # Состояния диалогов ручного ввода
 (P_DATE, P_FIO, P_TIRES, P_BAGS, P_THREAD, P_F01, P_F12, P_F24, P_F46, P_F68, P_CORD, P_NOTE) = range(12)
 (S_DATE, S_BUYER, S_PAYTYPE, S_FRAC, S_KG, S_PRICE, S_SUM_VAT, S_VAT, S_NOTE) = range(12, 21)
@@ -86,21 +78,18 @@ RU_MONTHS = {
 DAILY_CONFIRM = 49
 # NEW: Excel-выписка входящих платежей (переводы между компаниями группы)
 (VYP_BANK, VYP_CONFIRM) = range(50, 52)
-
+# NEW: запись производства по фракциям, когда «всего» на бланке распозналось неверно
+PHOTO_PROD_BYFRAC = 52
 FRACTIONS = ["0-1", "1-2", "2-4", "4-6", "6-8"]
-
 # Заголовки листов склада (порядок колонок = порядок записи)
 PROD_HEADERS = ["Дата", "ФИО оператора", "Вес шин кг", "Мешки шт", "Нитки",
                 "Фракция 0-1", "Фракция 1-2", "Фракция 2-4", "Фракция 4-6", "Фракция 6-8",
                 "Всего крошки кг", "Металлокорд кг", "Примечание"]
 SALES_HEADERS = ["Дата", "Покупатель", "Тип расчёта", "Фракция", "Количество кг",
                  "Цена за кг", "Сумма с НДС", "Сумма НДС", "Примечание"]
-
 _gc = None
 _spreadsheet = None
 _report_spreadsheet = None
-
-
 def parse_num(text):
     """Превращает '210', '210,5', ' 210 кг ' в число. Пустое/прочерк -> 0."""
     if text is None:
@@ -114,8 +103,6 @@ def parse_num(text):
         return int(num) if num == int(num) else num
     except Exception:
         return 0
-
-
 def parse_date_or_none(date_text):
     """Главная проверка даты. Принимает строку, которую отдал Claude или ввёл человек.
     Понимает обычные форматы С РАЗДЕЛИТЕЛЯМИ: '08.06.2026', '8.6.26', '8/6/2026', '8-6-26'.
@@ -144,15 +131,10 @@ def parse_date_or_none(date_text):
         except Exception:
             return None
     return None
-
-
 def date_to_str(dt):
     """datetime -> 'дд.мм.гггг'."""
     return dt.strftime("%d.%m.%Y")
-
-
 # ---------- контроль доступа ----------
-
 def is_allowed(update: Update) -> bool:
     """True, если пользователь в списке разрешённых.
     Если ALLOWED_USERS пуст — пускаем всех (страховка от самоблокировки)."""
@@ -160,10 +142,7 @@ def is_allowed(update: Update) -> bool:
         return True
     user = update.effective_user
     return bool(user and user.id in ALLOWED_USERS)
-
-
 # ---------- Google Sheets: подключение и доступ к листам ----------
-
 def _get_client():
     global _gc
     if _gc is None:
@@ -172,8 +151,6 @@ def _get_client():
         creds_dict = json.loads(GOOGLE_CREDENTIALS)
         _gc = gspread.service_account_from_dict(creds_dict)
     return _gc
-
-
 def get_spreadsheet():
     global _spreadsheet
     if _spreadsheet is not None:
@@ -182,8 +159,6 @@ def get_spreadsheet():
         raise RuntimeError("Не задан SPREADSHEET_ID в переменных окружения.")
     _spreadsheet = _get_client().open_by_key(SPREADSHEET_ID)
     return _spreadsheet
-
-
 def get_report_spreadsheet():
     global _report_spreadsheet
     if _report_spreadsheet is not None:
@@ -192,8 +167,6 @@ def get_report_spreadsheet():
         raise RuntimeError("Не задан REPORT_SPREADSHEET_ID в переменных окружения.")
     _report_spreadsheet = _get_client().open_by_key(REPORT_SPREADSHEET_ID)
     return _report_spreadsheet
-
-
 def get_worksheet(title, headers):
     sh = get_spreadsheet()
     try:
@@ -206,18 +179,11 @@ def get_worksheet(title, headers):
     if not first:
         ws.append_row(headers, value_input_option="USER_ENTERED")
     return ws
-
-
 def get_production_ws():
     return get_worksheet(SHEET_PRODUCTION, PROD_HEADERS)
-
-
 def get_sales_ws():
     return get_worksheet(SHEET_SALES, SALES_HEADERS)
-
-
 # ---------- Чтение/запись данных ----------
-
 def _fractions_signature(data):
     """NEW: подпись записи по фракциям (для сравнения дублей).
     Кортеж из 5 чисел фракций — устойчив к разнице в ФИО/примечании."""
@@ -228,8 +194,6 @@ def _fractions_signature(data):
         parse_num(data.get("фракция_4_6", 0)),
         parse_num(data.get("фракция_6_8", 0)),
     )
-
-
 def find_duplicate_production(data):
     """NEW: ищет в складе строку с той же датой И теми же фракциями.
     Возвращает True, если такая уже есть (вероятный дубль того же бланка).
@@ -238,10 +202,8 @@ def find_duplicate_production(data):
     rows = ws.get_all_values()
     if len(rows) <= 1:
         return False
-
     target_dt = parse_date_or_none(data.get("дата", ""))
     target_sig = _fractions_signature(data)
-
     for r in rows[1:]:
         row_date = r[0] if len(r) > 0 else ""
         # сравниваем даты по смыслу (а не по тексту): 08.06.2026 == 8.6.26
@@ -261,8 +223,6 @@ def find_duplicate_production(data):
         if row_sig == target_sig:
             return True
     return False
-
-
 def save_production(data):
     ws = get_production_ws()
     f01 = parse_num(data.get("фракция_0_1", 0))
@@ -284,8 +244,6 @@ def save_production(data):
         data.get("примечание", ""),
     ]
     ws.append_row(row, value_input_option="USER_ENTERED")
-
-
 def _note_with_bank(data):
     """Примечание продажи + банк поступления (нужно финотчёту; колонки листа не меняем)."""
     note = data.get("примечание", "")
@@ -293,8 +251,6 @@ def _note_with_bank(data):
     if bank:
         note = (note + "; " if note else "") + f"банк: {bank}"
     return note
-
-
 def save_sale(data):
     ws = get_sales_ws()
     qty_kg = parse_num(data.get("количество_кг", 0))
@@ -312,17 +268,12 @@ def save_sale(data):
         _note_with_bank(data),
     ]
     ws.append_row(row, value_input_option="USER_ENTERED")
-
-
 # ---------- запись реализации в отчёт "Реализация 2026г" ----------
-
 def _normalize_fraction(frac_text):
     for f in FRACTIONS:
         if f in str(frac_text):
             return f
     return None
-
-
 def _get_or_create_month_sheet(sh, dt):
     title = f"{RU_MONTHS[dt.month]} {dt.year}"
     try:
@@ -332,25 +283,19 @@ def _get_or_create_month_sheet(sh, dt):
     template = sh.worksheet(REPORT_TEMPLATE)
     new_ws = template.duplicate(new_sheet_name=title)
     return new_ws
-
-
 def write_sale_to_report(data):
     """Дописывает строку реализации в отчёт. Возвращает (ok: bool, msg: str)."""
     pay = str(data.get("тип_расчета", "")).strip()
     if pay not in REPORT_BLOCKS:
         return False, f"тип расчёта не распознан ('{pay}') — строка в отчёт не добавлена"
-
     frac = _normalize_fraction(data.get("фракция", ""))
     if frac is None:
         return False, "фракция не распознана — строка в отчёт не добавлена"
-
     dt = parse_date_or_none(data.get("дата", ""))
     if dt is None:
         return False, "дата не распознана — строка в отчёт не добавлена"
-
     sh = get_report_spreadsheet()
     ws = _get_or_create_month_sheet(sh, dt)
-
     start_row, end_row = REPORT_BLOCKS[pay]
     date_col_vals = ws.col_values(REPORT_DATE_COL)
     target_row = None
@@ -361,15 +306,12 @@ def write_sale_to_report(data):
             break
     if target_row is None:
         return False, f"блок «{pay}» заполнен (нет свободных строк) — строка не добавлена"
-
     qty_kg = parse_num(data.get("количество_кг", 0))
     if not qty_kg and data.get("количество_т"):
         qty_kg = parse_num(data.get("количество_т", 0)) * 1000
     price = parse_num(data.get("цена_за_кг", 0))
     total_sum = parse_num(data.get("сумма_с_ндс", 0))
-
     qcol, pcol, scol = REPORT_FRAC_COLS[frac]
-
     updates = [
         {"range": gspread.utils.rowcol_to_a1(target_row, REPORT_DATE_COL),
          "values": [[dt.strftime("%d.%m.%Y")]]},
@@ -381,10 +323,7 @@ def write_sale_to_report(data):
     ]
     ws.batch_update(updates, value_input_option="USER_ENTERED")
     return True, f"добавлено в «{ws.title}», блок «{pay}», строка {target_row}"
-
-
 # ---------- Остаток ----------
-
 def calc_stock():
     income = {k: 0 for k in FRACTIONS}
     ws_p = get_production_ws()
@@ -396,7 +335,6 @@ def calc_stock():
                     income[key] += float(str(r[i]).replace(",", ".")) if r[i] else 0
                 except Exception:
                     pass
-
     outcome = {k: 0 for k in FRACTIONS}
     ws_s = get_sales_ws()
     rows_s = ws_s.get_all_values()
@@ -410,13 +348,9 @@ def calc_stock():
                 except Exception:
                     pass
                 break
-
     stock = {k: income[k] - outcome[k] for k in income}
     return income, outcome, stock
-
-
 # ---------- Распознавание фото через Claude ----------
-
 async def call_claude(image_b64: str, prompt: str):
     async with httpx.AsyncClient(timeout=60) as client:
         response = await client.post(
@@ -443,35 +377,27 @@ async def call_claude(image_b64: str, prompt: str):
         text = result["content"][0]["text"].strip()
         text = re.sub(r'```json|```', '', text).strip()
         return json.loads(text)
-
-
 async def recognize_production(image_bytes: bytes):
     image_b64 = base64.b64encode(image_bytes).decode()
     prompt = """Это фото ежедневного отчёта по производству резиновой крошки.
 На фото может быть одна или несколько строк. Верни ТОЛЬКО JSON без markdown.
 Если одна строка — объект, если несколько — массив объектов. Формат:
 {"дата":"дд.мм.гггг","фио":"ФИО","вес_шин":0,"мешки":0,"нитки":0,"фракция_0_1":0,"фракция_1_2":0,"фракция_2_4":0,"фракция_4_6":0,"фракция_6_8":0,"всего_итог":0,"металл_корд":0,"примечание":""}
-
 ВАЖНО про ДАТУ:
 - На бланке дату часто пишут слитно, без нулей и точек: формат деньмесяцгод.
   Пример: "5626" означает 5.6.26 -> верни "05.06.2026".
   Пример: "151226" означает 15.12.26 -> верни "15.12.2026".
 - Год пишут двумя цифрами (26), это 2026 -> в ответе год всегда 4 цифры (2026).
 - В ответе дата ВСЕГДА в виде "дд.мм.гггг" с точками и ведущими нулями.
-
 ВАЖНО про ФРАКЦИИ:
 - В одной ячейке фракции может стоять ДВА числа: верхнее = мешки (штуки), нижнее = килограммы.
 - Бери ВСЕГДА НИЖНЕЕ число (килограммы). Верхнее (мешки) игнорируй.
 - Если число одно — это килограммы.
-
 ВАЖНО про ВСЕГО:
 - На бланке есть итоговое поле «всего крошки» (общий вес за смену в кг).
 - Прочитай это число и верни в "всего_итог" (если два числа — бери нижнее, кг). Если поля нет — 0.
-
 Если что-то не читается — ставь 0."""
     return await call_claude(image_b64, prompt)
-
-
 async def recognize_sale(image_bytes: bytes):
     image_b64 = base64.b64encode(image_bytes).decode()
     prompt = """Это фото накладной на отпуск/реализацию резиновой крошки.
@@ -483,10 +409,7 @@ async def recognize_sale(image_bytes: bytes):
 Сумму НДС бери из колонки "Сумма НДС" (только НДС). Если НДС в накладной нет — поставь 0.
 Дату верни в виде "дд.мм.гггг". Если не читается — 0."""
     return await call_claude(image_b64, prompt)
-
-
 # ---------- Команды и меню ----------
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text("⛔ Нет доступа. Обратитесь к администратору.")
@@ -509,8 +432,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/cancel — отменить ручной ввод",
         reply_markup=reply_markup
     )
-
-
 async def ostatok(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text("⛔ Нет доступа. Обратитесь к администратору.")
@@ -519,7 +440,6 @@ async def ostatok(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_in = sum(income.values())
     total_out = sum(outcome.values())
     total_stock = sum(stock.values())
-
     text = "📦 *ОСТАТОК НА СКЛАДЕ*\n\n"
     text += "```\n"
     text += f"{'Фракция':<8} {'Приход':>8} {'Расход':>8} {'Остаток':>9}\n"
@@ -529,10 +449,7 @@ async def ostatok(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += "-" * 37 + "\n"
     text += f"{'ИТОГО':<8} {total_in:>8.0f} {total_out:>8.0f} {total_stock:>9.0f}\n"
     text += "```\n_Все данные в кг_"
-
     await update.message.reply_text(text, parse_mode="Markdown")
-
-
 async def last_records(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text("⛔ Нет доступа. Обратитесь к администратору.")
@@ -551,10 +468,7 @@ async def last_records(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total = r[10] if len(r) > 10 and r[10] else "—"
         text += f"📅 {date} | {fio} | {total} кг\n"
     await update.message.reply_text(text, parse_mode="Markdown")
-
-
 # ---------- Ручной ввод: ПРОИЗВОДСТВО ----------
-
 async def manual_prod_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text("⛔ Нет доступа. Обратитесь к администратору.")
@@ -568,8 +482,6 @@ async def manual_prod_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
     return P_DATE
-
-
 async def manual_prod_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t.lower() == "сегодня":
@@ -585,62 +497,42 @@ async def manual_prod_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["prod"]["дата"] = date_to_str(dt)
     await update.message.reply_text("👤 ФИО оператора?")
     return P_FIO
-
-
 async def manual_prod_fio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["prod"]["фио"] = update.message.text.strip()
     await update.message.reply_text("⚖️ Вес шин, кг?")
     return P_TIRES
-
-
 async def manual_prod_tires(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["prod"]["вес_шин"] = parse_num(update.message.text)
     await update.message.reply_text("🧵 Нитки, кг? (или «-» если нет)")
     return P_THREAD
-
-
 async def manual_prod_thread(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["prod"]["нитки"] = parse_num(update.message.text)
     await update.message.reply_text("Фракция 0-1, кг?")
     return P_F01
-
-
 async def manual_prod_f01(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["prod"]["фракция_0_1"] = parse_num(update.message.text)
     await update.message.reply_text("Фракция 1-2, кг?")
     return P_F12
-
-
 async def manual_prod_f12(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["prod"]["фракция_1_2"] = parse_num(update.message.text)
     await update.message.reply_text("Фракция 2-4, кг?")
     return P_F24
-
-
 async def manual_prod_f24(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["prod"]["фракция_2_4"] = parse_num(update.message.text)
     await update.message.reply_text("Фракция 4-6, кг?")
     return P_F46
-
-
 async def manual_prod_f46(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["prod"]["фракция_4_6"] = parse_num(update.message.text)
     await update.message.reply_text("Фракция 6-8, кг?")
     return P_F68
-
-
 async def manual_prod_f68(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["prod"]["фракция_6_8"] = parse_num(update.message.text)
     await update.message.reply_text("🔩 Металлокорд, кг?")
     return P_CORD
-
-
 async def manual_prod_cord(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["prod"]["металл_корд"] = parse_num(update.message.text)
     await update.message.reply_text("📝 Примечание? (или «-» если нет)")
     return P_NOTE
-
-
 def _prod_summary(d):
     """Текст-подтверждение сохранённой записи производства."""
     total = (parse_num(d.get("фракция_0_1", 0)) + parse_num(d.get("фракция_1_2", 0))
@@ -662,13 +554,10 @@ def _prod_summary(d):
         f"  Всего: {total} кг\n\n"
         f"🔩 Металлокорд: {d.get('металл_корд', 0)} кг"
     )
-
-
 async def manual_prod_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     note = update.message.text.strip()
     context.user_data["prod"]["примечание"] = "" if note in ("-", "—") else note
     d = context.user_data["prod"]
-
     # NEW: при ручном вводе тоже предупреждаем о вероятном дубле (но сохраняем — это явное действие человека)
     dup_note = ""
     try:
@@ -676,16 +565,12 @@ async def manual_prod_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dup_note = "\n\n⚠️ Похоже, запись с этой датой и теми же фракциями уже есть — добавил ещё одну (ручной ввод)."
     except Exception as e:
         logger.error(f"dup check error (manual): {e}")
-
     save_production(d)
     schedule_refresh()
     await update.message.reply_text(_prod_summary(d) + dup_note, parse_mode="Markdown")
     context.user_data.pop("prod", None)
     return ConversationHandler.END
-
-
 # ---------- Ручной ввод: РЕАЛИЗАЦИЯ ----------
-
 async def manual_sale_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text("⛔ Нет доступа. Обратитесь к администратору.")
@@ -698,8 +583,6 @@ async def manual_sale_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
     return S_DATE
-
-
 async def manual_sale_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t.lower() == "сегодня":
@@ -715,15 +598,11 @@ async def manual_sale_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["sale"]["дата"] = date_to_str(dt)
     await update.message.reply_text("🏢 Покупатель?")
     return S_BUYER
-
-
 async def manual_sale_buyer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["sale"]["покупатель"] = update.message.text.strip()
     kb = ReplyKeyboardMarkup([["Безналичный", "Наличный"], ["❌ Отмена"]], resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text("💳 Тип расчёта? (Безналичный / Наличный)", reply_markup=kb)
     return S_PAYTYPE
-
-
 async def manual_sale_paytype(update: Update, context: ContextTypes.DEFAULT_TYPE):
     val = update.message.text.strip().lower()
     if "нал" in val and "без" not in val:
@@ -744,8 +623,6 @@ async def manual_sale_paytype(update: Update, context: ContextTypes.DEFAULT_TYPE
         parse_mode="Markdown"
     )
     return S_FRAC
-
-
 async def manual_sale_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Банк поступления при безнал-продаже (для финотчёта)."""
     val = update.message.text.strip().lower()
@@ -766,8 +643,6 @@ async def manual_sale_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
     return S_FRAC
-
-
 async def manual_sale_frac(update: Update, context: ContextTypes.DEFAULT_TYPE):
     frac = update.message.text.strip()
     if not any(f in frac for f in FRACTIONS):
@@ -778,39 +653,28 @@ async def manual_sale_frac(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["sale"]["фракция"] = frac
     await update.message.reply_text("⚖️ Количество, кг?")
     return S_KG
-
-
 async def manual_sale_kg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["sale"]["количество_кг"] = parse_num(update.message.text)
     await update.message.reply_text("💵 Цена за кг, тнг? (как в накладной)")
     return S_PRICE
-
-
 async def manual_sale_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["sale"]["цена_за_кг"] = parse_num(update.message.text)
     await update.message.reply_text("💰 Сумма с НДС, тнг?")
     return S_SUM_VAT
-
-
 async def manual_sale_sum_vat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["sale"]["сумма_с_ндс"] = parse_num(update.message.text)
     await update.message.reply_text("💰 Сумма НДС, тнг? (или «-» если нет)")
     return S_VAT
-
-
 async def manual_sale_vat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["sale"]["сумма_ндс"] = parse_num(update.message.text)
     await update.message.reply_text("📝 Примечание? (или «-» если нет)")
     return S_NOTE
-
-
 async def manual_sale_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     note = update.message.text.strip()
     context.user_data["sale"]["примечание"] = "" if note in ("-", "—") else note
     d = context.user_data["sale"]
     save_sale(d)
     schedule_refresh()
-
     report_line = ""
     try:
         ok, msg = write_sale_to_report(d)
@@ -818,7 +682,6 @@ async def manual_sale_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Report write error: {e}")
         report_line = "\n\n⚠️ Отчёт: не удалось записать (склад сохранён)."
-
     qty_kg = parse_num(d.get("количество_кг", 0))
     reply = (
         f"✅ *Реализация сохранена!*\n\n"
@@ -834,8 +697,6 @@ async def manual_sale_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(reply, parse_mode="Markdown")
     context.user_data.pop("sale", None)
     return ConversationHandler.END
-
-
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("prod", None)
     context.user_data.pop("sale", None)
@@ -845,13 +706,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("exp", None)
     await update.message.reply_text("❌ Отменено.")
     return ConversationHandler.END
-
-
 # «Спасательный круг»: кнопки главного меню (и «❌ Отмена») срабатывают ВСЕГДА,
 # даже посреди незаконченного ввода — сбрасывают его, чтобы бот не залипал.
 MENU_ESCAPE_RE = r"^(📸 Производство|📄 Реализация|✍️ Ввод производства|✍️ Ввод реализации|💸 Ввод расхода|👷 Смена|❌ Отмена)$"
-
-
 async def conv_menu_escape(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for k in ("prod", "sale", "exp", "pending_prod", "pending_sale", "pending_photo",
               "pending_payroll", "pending_tabel_raw", "pending_tabel_period",
@@ -863,10 +720,7 @@ async def conv_menu_escape(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "⏹ Прошлый незаконченный ввод отменён. Нажми нужную кнопку ещё раз.")
     return ConversationHandler.END
-
-
 # ---------- Фото и прочий текст ----------
-
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text("⛔ Нет доступа. Обратитесь к администратору.")
@@ -880,14 +734,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📄 Отправь фото накладной на реализацию.")
     else:
         await update.message.reply_text("Используй кнопки меню или команды /ostatok, /last")
-
-
 async def _save_sale_from_photo(update, data):
     """Сохранение реализации с фото + попытка записи в отчёт (вынесено для чистоты)."""
     data.setdefault("тип_расчета", "")
     save_sale(data)
     schedule_refresh()
-
     report_line = ""
     try:
         ok, msg = write_sale_to_report(data)
@@ -895,7 +746,6 @@ async def _save_sale_from_photo(update, data):
     except Exception as e:
         logger.error(f"Report write error: {e}")
         report_line = "\n⚠️ Отчёт: не удалось записать (склад сохранён)."
-
     qty_kg = parse_num(data.get("количество_кг", 0))
     if not qty_kg and data.get("количество_т"):
         qty_kg = parse_num(data.get("количество_т", 0)) * 1000
@@ -911,8 +761,6 @@ async def _save_sale_from_photo(update, data):
         f"💰 Сумма НДС: {data.get('сумма_ндс', 0)} тнг" + report_line
     )
     await update.message.reply_text(reply, parse_mode="Markdown")
-
-
 async def photo_sale_paytype(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Доспрос нал/безнал после фото-реализации, затем запись в склад и отчёт."""
     val = update.message.text.strip().lower()
@@ -931,8 +779,6 @@ async def photo_sale_paytype(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("🏦 На какой банк придёт оплата?", reply_markup=kb)
         return PHOTO_SALE_BANK
     return await _photo_sale_followup(update, context)
-
-
 async def _photo_sale_followup(update, context):
     """После типа расчёта/банка доспрашивает недостающее (кол-во, цену, НДС) и сохраняет.
     Нужно для платёжек: там видна только сумма, без кг и цены."""
@@ -969,8 +815,6 @@ async def _photo_sale_followup(update, context):
     context.user_data.pop("pending_sale", None)
     context.user_data["photo_type"] = "production"
     return ConversationHandler.END
-
-
 async def photo_sale_kg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     qty = parse_num(update.message.text)
     if not qty:
@@ -978,8 +822,6 @@ async def photo_sale_kg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return PHOTO_SALE_KG
     context.user_data.get("pending_sale", {})["количество_кг"] = qty
     return await _photo_sale_followup(update, context)
-
-
 async def photo_sale_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     price = parse_num(update.message.text)
     if not price:
@@ -987,8 +829,6 @@ async def photo_sale_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return PHOTO_SALE_PRICE
     context.user_data.get("pending_sale", {})["цена_за_кг"] = price
     return await _photo_sale_followup(update, context)
-
-
 async def photo_sale_vat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip().lower()
     d = context.user_data.get("pending_sale", {})
@@ -1000,12 +840,8 @@ async def photo_sale_vat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         d["сумма_ндс"] = parse_num(update.message.text)
     d["_ндс_решён"] = True
     return await _photo_sale_followup(update, context)
-
-
 # Виды налогов на ФОТ — порядок важен (как в колонках ведомости и строках финотчёта)
 FOT_TAX_KEYS = ["ИПН", "Социальный налог", "Социальные отчисления", "ОПВ", "ОПВР", "ВОСМС", "ОСМС"]
-
-
 def _norm_period(s):
     """'за Июнь 2026 г.' -> 'июнь 2026' (для дедупликации по примечанию журнала)."""
     low = str(s).lower()
@@ -1013,8 +849,6 @@ def _norm_period(s):
     m = re.search(r"20\d\d", low)
     year = m.group(0) if m else str(datetime.now().year)
     return f"{mon} {year}" if mon else ""
-
-
 def _payroll_already_entered(period):
     """Сколько уже внесено в журнал по ведомости этого периода, по категориям.
     Нужно для накопительной таблицы: добавляем только дельту, дубли исключены."""
@@ -1035,8 +869,6 @@ def _payroll_already_entered(period):
         cat = str(row[3]).strip()
         have[cat] = have.get(cat, 0) + parse_num(row[1])
     return have
-
-
 async def recognize_payroll(image_bytes: bytes):
     """Распознаёт расчётную ведомость: зарплата по разделам + оплаченные налоги ФОТ."""
     image_b64 = base64.b64encode(image_bytes).decode()
@@ -1053,8 +885,6 @@ async def recognize_payroll(image_bytes: bytes):
         "Бери именно итоговые строки, не отдельных сотрудников."
     )
     return await call_claude(image_b64, prompt)
-
-
 async def payroll_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip().lower()
     d = context.user_data.get("pending_payroll", {})
@@ -1072,8 +902,6 @@ async def payroll_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🏦 С какого банка перечислена зарплата?", reply_markup=kb)
         return PAYROLL_BANK
     return await _payroll_confirm_ask(update, context)
-
-
 async def payroll_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     val = update.message.text.strip().lower()
     if "евраз" in val:
@@ -1085,8 +913,6 @@ async def payroll_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return PAYROLL_BANK
     context.user_data.get("pending_payroll", {})["банк"] = bank
     return await _payroll_confirm_ask(update, context)
-
-
 async def _payroll_confirm_ask(update, context):
     d = context.user_data.get("pending_payroll", {})
     items = "\n".join(f"• {i['категория']}: {round(parse_num(i['сумма']))} тнг"
@@ -1102,8 +928,6 @@ async def _payroll_confirm_ask(update, context):
         f"💰 Итого добавляется: {round(t_add)} тнг. Всё разнесётся по отчётам само.",
         reply_markup=kb)
     return PAYROLL_CONFIRM
-
-
 async def payroll_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ans = update.message.text.strip().lower()
     d = context.user_data.get("pending_payroll", {})
@@ -1122,17 +946,11 @@ async def payroll_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("pending_payroll", None)
     await update.message.reply_text("❌ Отменено, ничего не сохранено.")
     return ConversationHandler.END
-
-
 # ---------- Табель учёта рабочего времени ----------
 SHEET_TABEL = "Табель"
 TABEL_HEADERS = ["Дата", "Сотрудник", "Должность", "Часы", "Примечание"]
-
-
 def get_tabel_ws():
     return get_worksheet(SHEET_TABEL, TABEL_HEADERS)
-
-
 def _tabel_existing(month, year):
     """Ключи (день, сотрудник) уже внесённых записей табеля за месяц — для дедупликации."""
     have = set()
@@ -1149,8 +967,6 @@ def _tabel_existing(month, year):
             continue
         have.add((dt.day, _fin_norm(row[1])))
     return have
-
-
 def _tabel_period_nums(period):
     """'июнь 2026' -> (6, 2026) или None."""
     if not period:
@@ -1161,8 +977,6 @@ def _tabel_period_nums(period):
         return None
     year = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else datetime.now().year
     return mon, year
-
-
 async def recognize_tabel(image_bytes: bytes):
     """Распознаёт табель: сотрудники × дни месяца, отработанные часы."""
     image_b64 = base64.b64encode(image_bytes).decode()
@@ -1179,8 +993,6 @@ async def recognize_tabel(image_bytes: bytes):
         "внимательно (10 и «в» не путать); что не читается — пропусти."
     )
     return await call_claude(image_b64, prompt)
-
-
 async def _tabel_prepare(update, context):
     """Считает НОВЫЕ записи табеля (дедуп по дню+сотруднику) и просит подтверждение."""
     rawlist = context.user_data.get("pending_tabel_raw") or []
@@ -1243,8 +1055,6 @@ async def _tabel_prepare(update, context):
         f"⏱ Часов добавится: {round(hours)}{note}\n\nЗаписать в лист «Табель»?",
         reply_markup=kb)
     return TABEL_CONFIRM
-
-
 async def tabel_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     period = _norm_period(update.message.text)
     if not period:
@@ -1252,8 +1062,6 @@ async def tabel_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return TABEL_MONTH
     context.user_data["pending_tabel_period"] = period
     return await _tabel_prepare(update, context)
-
-
 async def tabel_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ans = update.message.text.strip().lower()
     rows = context.user_data.get("pending_tabel_rows") or []
@@ -1271,13 +1079,9 @@ async def tabel_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     await update.message.reply_text("❌ Отменено, ничего не сохранено.")
     return ConversationHandler.END
-
-
 # ---------- Справочник «Сотрудники» + отметка смены кнопками ----------
 SHEET_EMPLOYEES = "Сотрудники"
 EMPLOYEE_HEADERS = ["Сотрудник", "Должность", "Активен"]
-
-
 def get_employees():
     """Активные сотрудники из справочника: [(ФИО, должность), ...]."""
     ws = get_worksheet(SHEET_EMPLOYEES, EMPLOYEE_HEADERS)
@@ -1292,8 +1096,6 @@ def get_employees():
             continue
         out.append((fio, str(row[1]).strip()))
     return out
-
-
 def _seed_employees(tabel_rows):
     """Дописывает в справочник сотрудников, встреченных в табеле, которых там ещё нет."""
     ws = get_worksheet(SHEET_EMPLOYEES, EMPLOYEE_HEADERS)
@@ -1309,8 +1111,6 @@ def _seed_employees(tabel_rows):
         new.append([fio, role, "да"])
     if new:
         ws.append_rows(new, value_input_option="USER_ENTERED")
-
-
 # ---------- Excel-выписка входящих платежей: переводы между компаниями группы ----------
 SHEET_GROUP = "Группа компаний"
 GROUP_HEADERS = ["Компания", "БИН", "Метка в отчёте"]
@@ -1325,16 +1125,12 @@ GROUP_SEED = [
     ["ТОО Рудный-АБАТ-2006", "", "ТОО Рудный-АБАТ-2006"],
     ["ТОО Рудный-Тазалык-2006", "", "ТОО Рудный-Тазалык-2006 (предоплата за товар)"],
 ]
-
-
 def _norm_company(s):
     """'ТОО \"L-TRADING\"' -> 'ltrading' — для сравнения названий компаний."""
     s = str(s).lower()
     s = re.sub(r"[\"'«»“”]", "", s)
     s = re.sub(r"\b(тоо|ао|ип|оао|зао|ооо|llp|llc)\b", "", s)
     return re.sub(r"[^a-zа-я0-9ёі]", "", s)
-
-
 def get_group_companies():
     """Справочник компаний группы. Пустой лист заполняется стартовой пятёркой."""
     ws = get_worksheet(SHEET_GROUP, GROUP_HEADERS)
@@ -1350,8 +1146,6 @@ def get_group_companies():
             out.append({"name": name, "bin": re.sub(r"\D", "", str(r[1])),
                         "label": str(r[2]).strip() or name})
     return out
-
-
 def _match_group(payer, payer_bin, comps):
     """Компания группы по БИН (приоритет) или нормализованному названию."""
     for c in comps:
@@ -1364,8 +1158,6 @@ def _match_group(payer, payer_bin, comps):
         if pn == _norm_company(c["name"]):
             return c
     return None
-
-
 def get_accounts():
     """Наши счета: {IBAN: банк}."""
     out = {}
@@ -1373,13 +1165,9 @@ def get_accounts():
         if len(r) >= 2 and str(r[0]).strip():
             out[str(r[0]).strip().upper()] = str(r[1]).strip()
     return out
-
-
 def add_account(acc, bank):
     get_worksheet(SHEET_ACCOUNTS, ACCOUNTS_HEADERS).append_row(
         [acc, bank], value_input_option="USER_ENTERED")
-
-
 def _income_existing():
     """Ключи (дата, плательщик, сумма) уже внесённых поступлений — дедуп повторных выписок."""
     have = set()
@@ -1393,8 +1181,6 @@ def _income_existing():
     except Exception as e:
         logger.error(f"income read error: {e}")
     return have
-
-
 def _parse_bank_xlsx(content):
     """Разбирает банковскую выписку входящих платежей (xlsx). None — формат не распознан."""
     wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
@@ -1441,8 +1227,6 @@ def _parse_bank_xlsx(content):
             "бин": re.sub(r"\D", "", str(gv("бин"))),
         })
     return out
-
-
 async def handle_xlsx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Excel-файл в чате: выписка входящих платежей → переводы группы в «Поступления»."""
     if not is_allowed(update):
@@ -1497,8 +1281,6 @@ async def handle_xlsx(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb)
         return VYP_BANK
     return await _vyp_confirm_ask(update, context)
-
-
 async def vyp_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     val = update.message.text.strip().lower()
     if "евраз" in val:
@@ -1519,8 +1301,6 @@ async def vyp_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🏦 Ещё счёт:\n{d['unknown'][0]}\nКакой банк?", reply_markup=kb)
         return VYP_BANK
     return await _vyp_confirm_ask(update, context)
-
-
 async def _vyp_confirm_ask(update, context):
     d = context.user_data.get("pending_vyp", {})
     lines = "\n".join(
@@ -1539,8 +1319,6 @@ async def _vyp_confirm_ask(update, context):
         f"💰 Итого добавится: {round(total)} тнг{extra}\n\nЗаписать?",
         reply_markup=kb)
     return VYP_CONFIRM
-
-
 async def vyp_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ans = update.message.text.strip().lower()
     d = context.user_data.pop("pending_vyp", None) or {}
@@ -1557,8 +1335,6 @@ async def vyp_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Записано переводов группы: {len(out)}. Финотчёт обновится сам "
         f"(блок «Переводы между компаниями группы»).")
     return ConversationHandler.END
-
-
 async def recognize_daily(image_bytes: bytes):
     """Распознаёт комбинированный дневной отчёт смены: производство + кто работал."""
     image_b64 = base64.b64encode(image_bytes).decode()
@@ -1576,8 +1352,6 @@ async def recognize_daily(image_bytes: bytes):
         "таблицы (часы числом: 8, 10, 12). Чего нет на бланке — 0 или пусто."
     )
     return await call_claude(image_b64, prompt)
-
-
 async def daily_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ans = update.message.text.strip().lower()
     d = context.user_data.pop("pending_daily", None) or {}
@@ -1602,8 +1376,6 @@ async def daily_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Дневной отчёт записан: производство — {'да' if saved_prod else 'нет'}, "
         f"людей в табель — {len(rows)}. Остаток: /ostatok, табель — в кабинете.")
     return ConversationHandler.END
-
-
 async def smena_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text("⛔ Нет доступа.")
@@ -1615,8 +1387,6 @@ async def smena_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👷 Отмечаем смену. За какую дату? Нажми «Сегодня» или введи дд.мм.гггг.",
         reply_markup=kb)
     return SM_DATE
-
-
 async def smena_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip().lower()
     d = context.user_data.setdefault("smena", {"выбрано": {}})
@@ -1637,8 +1407,6 @@ async def smena_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     d["сотрудники"] = emps
     return await _smena_show(update, context)
-
-
 async def _smena_show(update, context):
     d = context.user_data.get("smena", {})
     rows = []
@@ -1652,8 +1420,6 @@ async def _smena_show(update, context):
         f"Выбрано: {len(d['выбрано'])}. Когда всё — «✅ Готово».",
         reply_markup=kb)
     return SM_PICK
-
-
 async def smena_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     d = context.user_data.get("smena")
@@ -1683,8 +1449,6 @@ async def smena_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
                              resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text(f"⏱ Сколько часов отработал {match}?", reply_markup=kb)
     return SM_HOURS
-
-
 async def smena_hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     d = context.user_data.get("smena", {})
@@ -1699,8 +1463,6 @@ async def smena_hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if fio:
         d["выбрано"][fio] = hv
     return await _smena_show(update, context)
-
-
 async def smena_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ans = update.message.text.strip().lower()
     d = context.user_data.get("smena", {})
@@ -1728,8 +1490,6 @@ async def smena_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Смена за {d.get('дата', '—')} записана: {len(rows)} чел.{note}\n"
         f"Смотреть — в кабинете, раздел «Табель».")
     return ConversationHandler.END
-
-
 async def photo_sale_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Доспрос банка после фото-реализации (безнал) — для финотчёта."""
     val = update.message.text.strip().lower()
@@ -1747,8 +1507,6 @@ async def photo_sale_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = context.user_data.get("pending_sale", {})
     data["банк"] = bank
     return await _photo_sale_followup(update, context)
-
-
 async def detect_doc_type(image_bytes: bytes):
     """Определяет по фото: накладная-реализация, отчёт производства или расходный документ."""
     image_b64 = base64.b64encode(image_bytes).decode()
@@ -1784,8 +1542,6 @@ async def detect_doc_type(image_bytes: bytes):
     if "расход" in t:
         return "expense"
     return "sale" if "реализ" in t else "production"
-
-
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Приём фото: определяем тип (реализация/производство) и просим подтвердить."""
     if not is_allowed(update):
@@ -1821,8 +1577,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"handle_photo detect error: {e}")
         await update.message.reply_text("❌ Не смог обработать фото. Попробуй ещё раз.")
         return ConversationHandler.END
-
-
 async def photo_type_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Подтверждение типа: Да — сохраняем; Нет — берём другой тип."""
     ans = update.message.text.strip().lower()
@@ -1857,8 +1611,6 @@ async def photo_type_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ Не смог скачать фото. Пришли заново.")
         return ConversationHandler.END
     return await _dispatch_photo(update, context, photo_type, image_bytes)
-
-
 async def _dispatch_photo(update, context, photo_type, image_bytes):
     """Распознаёт и сохраняет фото по подтверждённому типу."""
     try:
@@ -1923,7 +1675,6 @@ async def _dispatch_photo(update, context, photo_type, image_bytes):
                 f"👷 Работали:\n{lines}{skip}\n\nЗаписать?",
                 reply_markup=kb)
             return DAILY_CONFIRM
-
         if photo_type == "tabel":
             await update.message.reply_text("📅 Распознаю табель...")
             data = await recognize_tabel(image_bytes)
@@ -1935,7 +1686,6 @@ async def _dispatch_photo(update, context, photo_type, image_bytes):
             context.user_data["pending_tabel_raw"] = rawlist
             context.user_data["pending_tabel_period"] = _norm_period(str(data.get("месяц", "")))
             return await _tabel_prepare(update, context)
-
         if photo_type == "payroll":
             await update.message.reply_text("🧾 Распознаю ведомость ФОТ...")
             data = await recognize_payroll(image_bytes)
@@ -1984,13 +1734,11 @@ async def _dispatch_photo(update, context, photo_type, image_bytes):
             await update.message.reply_text(
                 head + "\n\n📅 Какой ДАТОЙ оплачено добавляемое? (дд.мм.гггг или «сегодня»)")
             return PAYROLL_DATE
-
         if photo_type == "expense":
             await update.message.reply_text("💸 Распознаю расходный документ...")
             data = await recognize_expense(image_bytes)
             logger.info(f"Expense photo data: {data}")
             return await _exp_from_photo_data(update, context, data)
-
         if photo_type == "sale":
             data = await recognize_sale(image_bytes)
             logger.info(f"Sale data: {data}")
@@ -2020,12 +1768,10 @@ async def _dispatch_photo(update, context, photo_type, image_bytes):
                 await update.message.reply_text("🏦 На какой банк придёт оплата?", reply_markup=kb)
                 return PHOTO_SALE_BANK
             return await _photo_sale_followup(update, context)
-
         # --- производство ---
         data = await recognize_production(image_bytes)
         logger.info(f"Production data: {data}")
         records = data if isinstance(data, list) else [data]
-
         # Проверяем дату КАЖДОЙ записи. Claude должен был отдать дд.мм.гггг.
         # Если дата не читается — НЕ пишем молча, а просим ввести вручную.
         bad_date = []
@@ -2035,7 +1781,6 @@ async def _dispatch_photo(update, context, photo_type, image_bytes):
                 bad_date.append(r)
             else:
                 r["дата"] = date_to_str(dt)  # приводим к единому виду дд.мм.гггг
-
         if bad_date:
             await update.message.reply_text(
                 "⚠️ Не смог уверенно прочитать ДАТУ на фото.\n\n"
@@ -2045,78 +1790,45 @@ async def _dispatch_photo(update, context, photo_type, image_bytes):
                 "В склад с этого фото ничего не записал."
             )
             return ConversationHandler.END
-
-        # Сверка: сумма по фракциям должна совпасть с «всего», написанным на бланке
+        # Сверка: сумма по фракциям должна совпасть с «всего», написанным на бланке.
+        # Если не сходится — НЕ отказываем наглухо: предлагаем «записать по фракциям»
+        # (их сумму бот и так пишет в «Всего крошки»), оператор глазами сверяет фракции с бланком.
         mismatch = []
         for r in records:
             written = parse_num(r.get("всего_итог", 0))
             calc = sum(parse_num(r.get(fk, 0)) for fk in
                        ("фракция_0_1", "фракция_1_2", "фракция_2_4", "фракция_4_6", "фракция_6_8"))
             if written and abs(calc - written) > 1:
-                mismatch.append((calc, written))
+                mismatch.append((r, calc, written))
         if mismatch:
-            calc, written = mismatch[0]
-            await update.message.reply_text(
-                "⚠️ Расхождение по сумме крошки.\n\n"
-                f"На бланке «всего»: {written:.0f} кг\n"
-                f"По распознанным фракциям: {calc:.0f} кг\n\n"
-                "Возможно, цифра распозналась неверно. Проверь фото и внеси смену вручную "
-                "через «✍️ Ввод производства», или переснимай чётче.\n\n"
-                "В склад с этого фото ничего не записал."
-            )
-            return ConversationHandler.END
-
-        # Делим на «чистые» (сразу пишем) и «вероятные дубли» (спросим)
-        clean, dups = [], []
-        for r in records:
-            try:
-                if find_duplicate_production(r):
-                    dups.append(r)
-                else:
-                    clean.append(r)
-            except Exception as e:
-                logger.error(f"dup check error (photo): {e}")
-                clean.append(r)  # если проверка упала — не теряем данные, пишем
-
-        # Чистые записи сохраняем сразу
-        for item in clean:
-            save_production(item)
-        if clean:
-            schedule_refresh()
-
-        # Если есть подозрение на дубль — спрашиваем по первому, остальные дубли держим в очереди
-        if dups:
-            context.user_data["pending_prod"] = dups
-            first_dup = dups[0]
-            sig_total = sum(_fractions_signature(first_dup))
-            saved_note = ""
-            if clean:
-                saved_note = f"\n\n(Заодно сохранил новых записей: {len(clean)}.)"
-            kb = ReplyKeyboardMarkup([["Да, добавить", "Нет, пропустить"]],
+            context.user_data["pending_prod_byfrac"] = records
+            blocks = []
+            for r, calc, written in mismatch:
+                bags = round(calc / 30) if calc else 0
+                rec_bags = parse_num(r.get("мешки", 0))
+                bag_line = ""
+                if rec_bags and round(rec_bags) == bags:
+                    bag_line = f"\n  ✓ сходится с мешками: {bags} меш. × 30 = {bags * 30} кг"
+                blocks.append(
+                    f"📅 {r.get('дата', '—')} · 👤 {r.get('фио', '—')}\n"
+                    f"  0-1: {parse_num(r.get('фракция_0_1', 0)):g}, "
+                    f"1-2: {parse_num(r.get('фракция_1_2', 0)):g}, "
+                    f"2-4: {parse_num(r.get('фракция_2_4', 0)):g}, "
+                    f"4-6: {parse_num(r.get('фракция_4_6', 0)):g}, "
+                    f"6-8: {parse_num(r.get('фракция_6_8', 0)):g}\n"
+                    f"  Сумма фракций: {calc:.0f} кг · на бланке «всего»: {written:.0f} кг{bag_line}"
+                )
+            kb = ReplyKeyboardMarkup([["✅ Записать по фракциям"], ["❌ Отмена"]],
                                      resize_keyboard=True, one_time_keyboard=True)
             await update.message.reply_text(
-                f"⚠️ Похоже, эта запись УЖЕ ЕСТЬ в складе:\n\n"
-                f"📅 Дата: {first_dup.get('дата', '—')}\n"
-                f"👤 Оператор: {first_dup.get('фио', '—')}\n"
-                f"⚖️ Всего крошки: {sig_total:.0f} кг\n\n"
-                f"Добавить её всё равно?" + saved_note,
-                reply_markup=kb,
-                parse_mode="Markdown"
-            )
-            return PHOTO_PROD_CONFIRM
-
-        # Дублей нет — обычный отчёт
-        if not clean:
-            await update.message.reply_text("⚠️ С фото не удалось получить данные. Попробуй ещё раз.")
-            return ConversationHandler.END
-
-        first = clean[-1]
-        await update.message.reply_text(
-            _prod_summary(first).replace("сохранено!", f"сохранено! (новых: {len(clean)})"),
-            parse_mode="Markdown"
-        )
-        return ConversationHandler.END
-
+                "⚠️ «Всего» на бланке не сошлось с суммой фракций "
+                "(вероятно, число «всего» распозналось неверно).\n\n"
+                + "\n\n".join(blocks) +
+                "\n\nСверь ФРАКЦИИ с бланком. Если они верны — запишу по ним "
+                "(в «Всего крошки» пойдёт сумма фракций). Если нет — «❌ Отмена» и внеси вручную.",
+                reply_markup=kb)
+            return PHOTO_PROD_BYFRAC
+        return await _finalize_production(update, context, records)
     except Exception as e:
         logger.error(f"Error: {e}")
         await update.message.reply_text(
@@ -2126,18 +1838,14 @@ async def _dispatch_photo(update, context, photo_type, image_bytes):
             "• Всё в кадре"
         )
         return ConversationHandler.END
-
-
 async def photo_prod_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """NEW: ответ Да/Нет на вопрос о дубле фото-производства."""
     ans = update.message.text.strip().lower()
     dups = context.user_data.get("pending_prod", [])
     context.user_data.pop("pending_prod", None)
-
     if not dups:
         await update.message.reply_text("Нечего подтверждать. Отправь фото заново.")
         return ConversationHandler.END
-
     if "да" in ans:
         for item in dups:
             save_production(item)
@@ -2151,10 +1859,64 @@ async def photo_prod_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "👍 Пропустил — дубль в склад не попал."
         )
     return ConversationHandler.END
-
-
+async def _finalize_production(update, context, records):
+    """Сохраняет записи производства: чистые — сразу, вероятные дубли — с подтверждением.
+    Вызывается и при обычном фото, и после подтверждения «записать по фракциям»."""
+    clean, dups = [], []
+    for r in records:
+        try:
+            if find_duplicate_production(r):
+                dups.append(r)
+            else:
+                clean.append(r)
+        except Exception as e:
+            logger.error(f"dup check error (photo): {e}")
+            clean.append(r)  # если проверка упала — не теряем данные, пишем
+    for item in clean:
+        save_production(item)
+    if clean:
+        schedule_refresh()
+    if dups:
+        context.user_data["pending_prod"] = dups
+        first_dup = dups[0]
+        sig_total = sum(_fractions_signature(first_dup))
+        saved_note = ""
+        if clean:
+            saved_note = f"\n\n(Заодно сохранил новых записей: {len(clean)}.)"
+        kb = ReplyKeyboardMarkup([["Да, добавить", "Нет, пропустить"]],
+                                 resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text(
+            f"⚠️ Похоже, эта запись УЖЕ ЕСТЬ в складе:\n\n"
+            f"📅 Дата: {first_dup.get('дата', '—')}\n"
+            f"👤 Оператор: {first_dup.get('фио', '—')}\n"
+            f"⚖️ Всего крошки: {sig_total:.0f} кг\n\n"
+            f"Добавить её всё равно?" + saved_note,
+            reply_markup=kb,
+            parse_mode="Markdown"
+        )
+        return PHOTO_PROD_CONFIRM
+    if not clean:
+        await update.message.reply_text("⚠️ С фото не удалось получить данные. Попробуй ещё раз.")
+        return ConversationHandler.END
+    first = clean[-1]
+    await update.message.reply_text(
+        _prod_summary(first).replace("сохранено!", f"сохранено! (новых: {len(clean)})"),
+        parse_mode="Markdown"
+    )
+    return ConversationHandler.END
+async def photo_prod_byfrac(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ответ на предложение записать производство по фракциям (когда «всего» не сошлось)."""
+    ans = update.message.text.strip().lower()
+    records = context.user_data.pop("pending_prod_byfrac", None) or []
+    if not records:
+        await update.message.reply_text("Нечего записывать. Пришли фото заново.")
+        return ConversationHandler.END
+    if "да" in ans or "запис" in ans or "фракц" in ans:
+        return await _finalize_production(update, context, records)
+    await update.message.reply_text(
+        "👍 Не записал. Переснимай чётче или внеси смену вручную через «✍️ Ввод производства».")
+    return ConversationHandler.END
 # ---------- Автобэкап данных в закрытый Telegram-канал ----------
-
 def _build_backup_xlsx():
     """Собирает один .xlsx: листы склада (Производство, Реализация) + вкладки отчёта реализации.
     Возвращает (bytes_файла, counts) — counts это число строк данных по ключевым листам."""
@@ -2184,8 +1946,6 @@ def _build_backup_xlsx():
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue(), counts
-
-
 async def do_backup(bot):
     """Собирает и отправляет бэкап в закрытый канал. Возвращает 'ok' или текст ошибки."""
     if not BACKUP_CHANNEL_ID:
@@ -2212,8 +1972,6 @@ async def do_backup(bot):
         caption=caption,
     )
     return "ok"
-
-
 async def _backup_loop(application):
     """Раз в сутки в BACKUP_HOUR по местному времени (UTC+5) делает бэкап."""
     await asyncio.sleep(10)
@@ -2236,12 +1994,8 @@ async def _backup_loop(application):
             await _run_refresh()  # страховочный суточный прогон «Калькуляции» и финотчёта
         except Exception as e:
             logger.error(f"scheduled refresh error: {e}")
-
-
 async def _post_init(application):
     application.create_task(_backup_loop(application))
-
-
 async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ручной запуск бэкапа для проверки. Только для разрешённых пользователей."""
     if not is_allowed(update):
@@ -2258,10 +2012,7 @@ async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Бэкап отправлен в канал.")
     else:
         await update.message.reply_text(f"⚠️ {res}")
-
-
 # ---------- Журнал «Расходы»: ввод расходов компании ----------
-
 SHEET_EXPENSES = "Расходы"
 EXPENSE_HEADERS = ["Дата", "Сумма", "Группа", "Категория", "Нал/Безнал", "Источник", "Контрагент", "Примечание"]
 EXPENSE_GROUPS = {
@@ -2279,20 +2030,14 @@ EXPENSE_GROUPS = {
     ],
 }
 EXPENSE_SOURCES = ["Евразийский", "БЦК", "Касса 1", "Касса 2", "Неденежный"]
-
-
 def get_expenses_ws():
     return get_worksheet(SHEET_EXPENSES, EXPENSE_HEADERS)
-
-
 def _source_to_paytype(src):
     if src in ("Евразийский", "БЦК"):
         return "Безналичный"
     if src in ("Касса 1", "Касса 2"):
         return "Наличный"
     return "Неденежный"
-
-
 def save_expense(data):
     ws = get_expenses_ws()
     src = data.get("источник", "")
@@ -2307,8 +2052,6 @@ def save_expense(data):
         data.get("примечание", ""),
     ]
     ws.append_row(row, value_input_option="USER_ENTERED")
-
-
 def _exp_summary(d, saved=True):
     head = "✅ *Расход сохранён!*" if saved else "Проверь расход перед сохранением:"
     return (
@@ -2321,16 +2064,12 @@ def _exp_summary(d, saved=True):
         f"🏢 Контрагент: {d.get('контрагент') or '—'}\n"
         f"📝 Примечание: {d.get('примечание') or '—'}"
     )
-
-
 # --- Справочник поставщиков (база) ---
 SHEET_SUPPLIERS = "Поставщики"
 SUPPLIER_HEADERS = ["Поставщик"]
 SUPPLIER_FUZZY = 0.88
 _LEGAL_PREFIXES = ("товарищество с ограниченной ответственностью", "индивидуальный предприниматель",
                    "тоо", "ип", "ао", "оао", "зао", "ооо", "чп", "кх")
-
-
 def _normalize_supplier(name):
     s = str(name).strip().lower()
     for ch in "«»\"'":
@@ -2340,12 +2079,8 @@ def _normalize_supplier(name):
     s = re.sub(r"[^\w\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
-
-
 def get_suppliers_ws():
     return get_worksheet(SHEET_SUPPLIERS, SUPPLIER_HEADERS)
-
-
 def load_suppliers():
     try:
         vals = get_suppliers_ws().col_values(1)[1:]
@@ -2353,8 +2088,6 @@ def load_suppliers():
         logger.error(f"load_suppliers: {e}")
         return []
     return [str(v).strip() for v in vals if str(v).strip()]
-
-
 def add_supplier(name):
     name = str(name).strip()
     if not name:
@@ -2363,8 +2096,6 @@ def add_supplier(name):
         get_suppliers_ws().append_row([name], value_input_option="USER_ENTERED")
     except Exception as e:
         logger.error(f"add_supplier: {e}")
-
-
 def match_supplier(name):
     """Возвращает (status, canonical): 'exact' | 'fuzzy' | 'new'."""
     import difflib
@@ -2383,8 +2114,6 @@ def match_supplier(name):
     if best is not None and best_r >= SUPPLIER_FUZZY:
         return ("fuzzy", best)
     return ("new", name)
-
-
 async def _supplier_resolve(update, context, name):
     """Сверка поставщика. Возвращает следующий state или None (можно идти дальше)."""
     context.user_data["exp"]["контрагент"] = name
@@ -2405,8 +2134,6 @@ async def _supplier_resolve(update, context, name):
     await update.message.reply_text(
         f"🆕 Новый поставщик: «{name}». Проверь, правильно ли имя. Записать в базу?", reply_markup=kb)
     return E_SUP_NEW
-
-
 async def _supplier_done(update, context):
     """Дальше после поставщика: фото → группа, ручной → примечание."""
     if context.user_data.get("exp", {}).get("_photo"):
@@ -2416,8 +2143,6 @@ async def _supplier_done(update, context):
         return E_GROUP
     await update.message.reply_text("📝 Примечание? Или «-», если нет.")
     return E_NOTE
-
-
 async def exp_sup_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ответ на «похоже на X»."""
     ans = update.message.text.strip().lower()
@@ -2433,8 +2158,6 @@ async def exp_sup_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🆕 Новый поставщик: «{name}». Проверь, правильно ли имя. Записать в базу?", reply_markup=kb)
     return E_SUP_NEW
-
-
 async def exp_sup_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Подтверждение нового поставщика перед записью в базу."""
     ans = update.message.text.strip().lower()
@@ -2444,8 +2167,6 @@ async def exp_sup_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await _supplier_done(update, context)
     await update.message.reply_text("✏️ Введи правильное имя поставщика:")
     return E_SUP_EDIT
-
-
 async def exp_sup_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Исправленное имя → повторная сверка."""
     name = update.message.text.strip()
@@ -2453,8 +2174,6 @@ async def exp_sup_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if nxt is not None:
         return nxt
     return await _supplier_done(update, context)
-
-
 async def manual_exp_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text("⛔ Нет доступа.")
@@ -2462,8 +2181,6 @@ async def manual_exp_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["exp"] = {}
     await update.message.reply_text("💸 Внесём расход. Пришли ФОТО счёта/чека — распознаю сам, или введи дату вручную (дд.мм.гггг или «сегодня»).")
     return E_DATE
-
-
 async def manual_exp_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip().lower()
     if t in ("сегодня", "today"):
@@ -2476,8 +2193,6 @@ async def manual_exp_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["exp"]["дата"] = date_to_str(dt)
     await update.message.reply_text("💵 Сумма расхода, тенге?")
     return E_AMOUNT
-
-
 async def manual_exp_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     amt = parse_num(update.message.text)
     if not amt:
@@ -2488,8 +2203,6 @@ async def manual_exp_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
                              resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text("📂 Группа расхода?", reply_markup=kb)
     return E_GROUP
-
-
 async def manual_exp_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     grp = update.message.text.strip()
     if grp not in EXPENSE_GROUPS:
@@ -2500,8 +2213,6 @@ async def manual_exp_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
                              resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text("🏷 Категория?", reply_markup=kb)
     return E_CATEGORY
-
-
 async def manual_exp_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cat = update.message.text.strip()
     if "назад" in cat.lower():
@@ -2520,8 +2231,6 @@ async def manual_exp_category(update: Update, context: ContextTypes.DEFAULT_TYPE
                              resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text("🏦 Источник (откуда оплата)?", reply_markup=kb)
     return E_SOURCE
-
-
 async def manual_exp_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
     src = update.message.text.strip()
     if "назад" in src.lower():
@@ -2538,8 +2247,6 @@ async def manual_exp_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await _ask_note(update, context)
     await update.message.reply_text("🏢 Контрагент (кому платим)? Или «-», если не нужно.")
     return E_CONTRAGENT
-
-
 async def manual_exp_contragent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     name = "" if t in ("-", "—") else t
@@ -2548,8 +2255,6 @@ async def manual_exp_contragent(update: Update, context: ContextTypes.DEFAULT_TY
         return nxt
     await update.message.reply_text("📝 Примечание? Или «-», если нет.")
     return E_NOTE
-
-
 async def _ask_note(update, context):
     """Шаг «за что платим». Если с фото распознано назначение — предлагаем оставить его."""
     rec = context.user_data["exp"].get("примечание", "")
@@ -2566,8 +2271,6 @@ async def _ask_note(update, context):
         await update.message.reply_text(
             "📝 За что платим? Напиши примечание (или «-», если не нужно).", reply_markup=kb)
     return E_NOTE
-
-
 async def manual_exp_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     low = t.lower()
@@ -2587,8 +2290,6 @@ async def manual_exp_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(_exp_summary(context.user_data["exp"], saved=False),
                                     reply_markup=kb, parse_mode="Markdown")
     return E_CONFIRM
-
-
 async def manual_exp_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ans = update.message.text.strip().lower()
     if "назад" in ans:
@@ -2606,8 +2307,6 @@ async def manual_exp_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
     await update.message.reply_text("Нажми «✅ Да, сохранить» или «❌ Отмена».")
     return E_CONFIRM
-
-
 async def recognize_expense(image_bytes: bytes):
     """Распознаёт расходный документ (счёт/чек/накладную на покупку)."""
     image_b64 = base64.b64encode(image_bytes).decode()
@@ -2621,8 +2320,6 @@ async def recognize_expense(image_bytes: bytes):
         "Назначение — короткая суть (например «электроэнергия за май», «запчасти к станку»). Если что-то не читается — 0 или пусто."
     )
     return await call_claude(image_b64, prompt)
-
-
 async def manual_exp_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Фото счёта/чека внутри «Ввод расхода»: распознаём сумму/контрагента/дату."""
     await update.message.reply_text("📸 Получил фото, распознаю расход...")
@@ -2637,8 +2334,6 @@ async def manual_exp_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Не смог распознать фото. Введи дату вручную (дд.мм.гггг) или пришли фото чётче.")
         return E_DATE
     return await _exp_from_photo_data(update, context, data)
-
-
 async def _exp_from_photo_data(update, context, data):
     """Заполняет черновик расхода из распознанного фото и ведёт дальше по шагам.
     Используется и внутри «💸 Ввод расхода», и когда фото-расход пришёл без старта."""
@@ -2666,8 +2361,6 @@ async def _exp_from_photo_data(update, context, data):
                              resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text("Выбери группу расхода:", reply_markup=kb)
     return E_GROUP
-
-
 def _build_svod():
     """Пересобирает лист «Свод расходов»: категории × месяцы, суммы из журнала «Расходы» (готовые числа, не формулы)."""
     book = get_spreadsheet()
@@ -2710,8 +2403,6 @@ def _build_svod():
             data.append(row_vals)
     ws.update(range_name="A1", values=data, value_input_option="USER_ENTERED")
     return title, year
-
-
 def _build_sebes():
     """Лист «Себестоимость (авто)»: по месяцам — производство, расходы по категориям, полная себестоимость, выручка, прибыль, себестоимость 1 кг."""
     book = get_spreadsheet()
@@ -2764,7 +2455,6 @@ def _build_sebes():
         cat = str(row[3]).strip()
         cat_sums.setdefault(cat, {})
         cat_sums[cat][dt.month] = cat_sums[cat].get(dt.month, 0) + s
-
     prodcats = EXPENSE_GROUPS["Производство"]
     admcats = EXPENSE_GROUPS["Администрация"]
     def cs(c, m):
@@ -2807,8 +2497,6 @@ def _build_sebes():
         ws = book.add_worksheet(title=title, rows=45, cols=14)
     ws.update(range_name="A1", values=data, value_input_option="USER_ENTERED")
     return title
-
-
 async def cmd_svod(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Собрать/обновить лист «Свод расходов». Только для разрешённых."""
     if not is_allowed(update):
@@ -2826,8 +2514,6 @@ async def cmd_svod(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Готово (год {year}): листы «{title}» и «{title2}». "
         f"«Свод расходов» — расходы по категориям; «Себестоимость (авто)» — производство, расходы, полная себестоимость, выручка, прибыль и себестоимость 1 кг по месяцам."
     )
-
-
 # --- Запись себестоимости в файл экономиста («Калькуляция себестоимости») ---
 SEBES_FILE_ID = "1ZKYCFVKrb0l-mzYQ0gtiHKOJbTNHd9TcJ9hN9i5RiFk"
 KALK_SHEET = "Калькуляция себестоимости"
@@ -2843,16 +2529,12 @@ KALK_ROWS = {
     24: "Прочие административные", 25: "Амортизация административная",
     32: "Лизинг (основной долг)", 33: "Основные средства",
 }
-
-
 def _col_letter(n):
     s = ""
     while n > 0:
         n, r = divmod(n - 1, 26)
         s = chr(65 + r) + s
     return s
-
-
 def _ensure_kalk_column(book, ws, month):
     """Находит столбец месяца в «Калькуляции» или создаёт его (перед «Итого», с форматом соседа).
     Возвращает (col_1based, created)."""
@@ -2875,8 +2557,6 @@ def _ensure_kalk_column(book, ws, month):
     ]})
     ws.update_cell(2, itog_idx, target.capitalize())
     return itog_idx, True
-
-
 def _fill_kalk(month):
     """Заполняет (и при необходимости создаёт) столбец месяца в «Калькуляции». Возвращает (col, crumb, created)."""
     skl = get_spreadsheet()
@@ -2939,8 +2619,6 @@ def _fill_kalk(month):
         updates.append({"range": col + str(r), "values": [[v]]})
     ws.batch_update(updates, value_input_option="USER_ENTERED")
     return col, crumb, created
-
-
 async def cmd_kalk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Заполнить текущий месяц в «Калькуляции» файла экономиста."""
     if not is_allowed(update):
@@ -2959,14 +2637,11 @@ async def cmd_kalk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ Столбец «{RU_MONTHS_FULL[month]}»{note} в «Калькуляции» заполнен: производство + расходы. "
         f"Произведено крошки: {round(crumb)} кг. Итоги и себестоимость 1 кг посчитаны.")
-
-
 # ---------- /fin: автозаполнение месячной вкладки финотчёта (v1) ----------
 # Бот заполняет ТОЛЬКО свои блоки: безнал-поступления (ERG / Юр.лица, по банкам),
 # 5 групп безнал-расходов и наличные расходы Касса 1 / Касса 2.
 # Блоки бухгалтера (ФОТ с разбивкой, налоги, лизинг, банк, снятие, переводы группы,
 # все наличные поступления) бот НЕ трогает. Строки ищутся по меткам, не по номерам.
-
 FIN_BANKS = ("Евразийский", "БЦК")
 # категория журнала «Расходы» -> группа безнал-расхода в финотчёте (метка строки)
 FIN_GROUP_OF_CAT = {
@@ -2991,22 +2666,14 @@ FIN_LEAF_NAME = {
 }
 FIN_GROUPS = ["основные средства", "материалы и запасные части", "гсм",
               "транспортные услуги", "ао «фонд", "прочие расходы"]
-
-
 def _fin_norm(s):
     return re.sub(r"\s+", " ", str(s)).strip().lower()
-
-
 def _bank_of_sale_note(note):
     """Банк из примечания продажи ('банк: БЦК'). Старые записи без банка -> Евразийский."""
     return "БЦК" if "бцк" in str(note).lower() else "Евразийский"
-
-
 def _is_erg_buyer(buyer):
     b = str(buyer).lower()
     return "ссгпо" in b or "erg" in b
-
-
 def _fin_collect(month):
     """Данные месяца из склада: безнал-поступления (продажи), безнал- и нал-расходы."""
     skl = get_spreadsheet()
@@ -3091,8 +2758,6 @@ def _fin_collect(month):
     except Exception as e:
         logger.error(f"transfers collect error: {e}")
     return inc, cashless, cash, salary, fot_tax, transfers
-
-
 def _fin_find(grid, needle, start=0, end=None):
     """Индекс строки (0-based), метка в колонке A начинается с needle."""
     e = len(grid) if end is None else end
@@ -3101,8 +2766,6 @@ def _fin_find(grid, needle, start=0, end=None):
         if a.startswith(needle):
             return i
     return None
-
-
 def _fin_leaf_range(grid, gi):
     """Диапазон строк-листьев группы из формулы B '=SUM(B22:B24)'. None — группа без листьев."""
     b = str(grid[gi][1]) if len(grid[gi]) > 1 else ""
@@ -3110,16 +2773,12 @@ def _fin_leaf_range(grid, gi):
     if not m:
         return None
     return int(m.group(1)), int(m.group(2) or m.group(1))
-
-
 def _fin_insert_rows(book, ws, after_row, count):
     """Вставляет count строк ПОСЛЕ 1-based строки after_row (внутри диапазона, формат сверху)."""
     book.batch_update({"requests": [{"insertDimension": {
         "range": {"sheetId": ws.id, "dimension": "ROWS",
                   "startIndex": after_row, "endIndex": after_row + count},
         "inheritFromBefore": True}}]})
-
-
 def _fin_write_group_leaves(book, ws, grid, gi, items):
     """Переписывает подстроки группы (контрагент × банки). Если подстрок нет — создаёт.
     items: [(имя, {банк: сумма}), ...]. gi — 0-based строка группы."""
@@ -3156,8 +2815,6 @@ def _fin_write_group_leaves(book, ws, grid, gi, items):
     data.append({"range": f"C{gi + 1}", "values": [[f"=SUM(C{r1}:C{r2})"]]})
     data.append({"range": f"D{gi + 1}", "values": [[f"=SUM(B{gi + 1}:C{gi + 1})"]]})
     ws.batch_update(data, value_input_option="USER_ENTERED")
-
-
 def _fill_fin(month):
     """Заполняет вкладку месяца в финотчёте. Возвращает текст-сводку."""
     inc, cashless, cash, salary, fot_tax, transfers = _fin_collect(month)
@@ -3179,7 +2836,6 @@ def _fill_fin(month):
             raise RuntimeError("не нашёл вкладку прошлого месяца как шаблон")
         ws = prev.duplicate(new_sheet_name=name, insert_sheet_index=prev.index + 1)
         created = True
-
     grid = ws.get(value_render_option="FORMULA")
     zeroed = False
     head = _fin_norm(grid[0][0] if grid and grid[0] else "")
@@ -3196,13 +2852,11 @@ def _fill_fin(month):
         ws.batch_update(ups, value_input_option="USER_ENTERED")
         zeroed = True
         grid = ws.get(value_render_option="FORMULA")
-
     i_rash = _fin_find(grid, "безналичный расход")
     i_nalpost = _fin_find(grid, "наличные поступления")
     i_nalrash = _fin_find(grid, "наличные расходы")
     if None in (i_rash, i_nalpost, i_nalrash):
         raise RuntimeError("не нашёл разделы вкладки (БЕЗНАЛИЧНЫЙ РАСХОД / НАЛИЧНЫЕ ...)")
-
     # 1) безнал-поступления от продаж: ERG (один контрагент — пишем в строку);
     # Юр.лица раскладываются по покупателям в самом конце (шаг 4), т.к. там вставка строк
     i = _fin_find(grid, "erg", 0, i_rash)
@@ -3211,7 +2865,6 @@ def _fill_fin(month):
             {"range": f"B{i + 1}", "values": [[round(inc['erg']['Евразийский'], 2)]]},
             {"range": f"C{i + 1}", "values": [[round(inc['erg']['БЦК'], 2)]]},
         ], value_input_option="USER_ENTERED")
-
     # 1.5) блок ФОТ: зарплата + оплаченные налоги ФОТ (по ведомости через бот).
     # Исполнительные листы — бухгалтер, не трогаем.
     if salary["Евразийский"] or salary["БЦК"] or fot_tax:
@@ -3247,7 +2900,6 @@ def _fill_fin(month):
                 ups2.append({"range": f"C{ti + 1}", "values": [[round(v["БЦК"], 2)]]})
             if ups2:
                 ws.batch_update(ups2, value_input_option="USER_ENTERED")
-
     # 2) наличные расходы: Касса 2, затем Касса 1 (снизу вверх, чтобы вставки не сдвигали)
     for kassa in ("Касса 2", "Касса 1"):
         h = _fin_find(grid, _fin_norm(kassa), i_nalrash)
@@ -3275,7 +2927,6 @@ def _fill_fin(month):
                 data.append({"range": f"D{r}", "values": [[0]]})
         data.append({"range": f"D{r2 + 1}", "values": [[f"=SUM(D{r1}:D{r2})"]]})
         ws.batch_update(data, value_input_option="USER_ENTERED")
-
     # 3) безнал-расходы: группы бота, снизу вверх (контрагенты — подстроками)
     for gname in reversed(FIN_GROUPS):
         gi = _fin_find(grid, gname, i_rash, i_nalpost)
@@ -3284,7 +2935,6 @@ def _fill_fin(month):
         items = sorted(cashless.get(gname, {}).items(),
                        key=lambda kv: -(kv[1]["Евразийский"] + kv[1]["БЦК"]))
         _fin_write_group_leaves(book, ws, grid, gi, items)
-
     # 4) переводы между компаниями группы (из Excel-выписок) — если данные есть
     if transfers:
         gi = _fin_find(grid, "переводы между", 0, i_rash)
@@ -3292,7 +2942,6 @@ def _fill_fin(month):
             items = sorted(transfers.items(),
                            key=lambda kv: -(kv[1]["Евразийский"] + kv[1]["БЦК"]))
             _fin_write_group_leaves(book, ws, grid, gi, items)
-
     # 5) Юр.лица: раскладываем по ПОКУПАТЕЛЯМ (кто сколько оплатил) — в самом конце,
     # т.к. вставка строк вверху сдвигает всё ниже (уже записанное переедет вместе со строками)
     gi = _fin_find(grid, "юр", 0, i_rash)
@@ -3300,7 +2949,6 @@ def _fill_fin(month):
         items = sorted(inc["jur_by"].items(),
                        key=lambda kv: -(kv[1]["Евразийский"] + kv[1]["БЦК"]))
         _fin_write_group_leaves(book, ws, grid, gi, items)
-
     t_inc = sum(inc["erg"].values()) + sum(
         v[b] for v in inc["jur_by"].values() for b in FIN_BANKS)
     t_out = sum(v[b] for g in cashless.values() for v in g.values() for b in FIN_BANKS)
@@ -3323,8 +2971,6 @@ def _fill_fin(month):
             f"🧾 Налоги ФОТ (оплачено): {round(t_tax)} тнг\n"
             f"💵 Нал-расходы: Касса 1 — {round(t_k1)}, Касса 2 — {round(t_k2)} тнг\n\n"
             f"Блоки бухгалтера (исп. листы, прочие налоги, переводы, нал-поступления) не тронуты.")
-
-
 async def cmd_fin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Заполнить вкладку текущего месяца в финотчёте экономиста."""
     if not is_allowed(update):
@@ -3346,14 +2992,10 @@ async def cmd_fin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"reports error: {e}")
         summary += f"\n\n⚠️ Сводные листы не обновились: {e}"
     await update.message.reply_text(summary)
-
-
 # ---------- сводные листы финотчёта: «Выводы», «Графики», «Анализ и выводы» ----------
-
 VYV_SHEET = "Выводы (5 мес)"   # имя листа НЕ меняем — на него могут быть ссылки
 GRAF_SHEET = "Графики"
 ANAL_SHEET = "Анализ и выводы"
-
 # строки «Выводов» -> строка на вкладке месяца: (метка в «Выводах», метка месяца, секция)
 # секции: 0 = безнал-поступления, 1 = безнал-расход, 2 = наличные и итоги
 VYV_MAP = [
@@ -3383,12 +3025,8 @@ VYV_MAP = [
     ("всего поступлений", "всего поступлений", 2),
     ("всего расходов", "всего расходов", 2),
 ]
-
-
 def _mln(v):
     return f"{v / 1e6:.1f}".replace(".", ",")
-
-
 def _fill_reports(month):
     """Обновляет «Выводы», «Графики», «Анализ и выводы» по вкладке месяца."""
     book = _get_client().open_by_key(SEBES_FILE_ID)
@@ -3401,7 +3039,6 @@ def _fill_reports(month):
     if mi_rash is None or mi_nalpost is None:
         raise RuntimeError("вкладка месяца: не нашёл разделы")
     msec = {0: (0, mi_rash), 1: (mi_rash, mi_nalpost), 2: (mi_nalpost, len(mg))}
-
     # ===== «Выводы»: столбец месяца формулами на вкладку месяца =====
     vyv = book.worksheet(VYV_SHEET)
     vg = vyv.get(value_render_option="FORMULA")
@@ -3448,12 +3085,10 @@ def _fill_reports(month):
         f'ТОО "Едiл и компания" — сводка и выводы за январь–{name} {year} г. (тенге)']]})
     ups.append({"range": f"{itog}2", "values": [[f"Итого {n_mon} мес"]]})
     vyv.batch_update(ups, value_input_option="USER_ENTERED")
-
     # адреса итоговых строк на вкладке месяца (нужны «Графикам» и «Анализу»)
     m_post = _fin_find(mg, "всего поступлений") + 1
     m_rash = _fin_find(mg, "всего расходов") + 1
     m_oper = _fin_find(mg, "итого расход без вн.оборота", mi_rash) + 1
-
     # ===== «Графики»: строка месяца + структура расходов =====
     gws = book.worksheet(GRAF_SHEET)
     gg = gws.get(value_render_option="FORMULA")
@@ -3500,7 +3135,6 @@ def _fill_reports(month):
     if hdr is not None:
         ups.append({"range": f"B{hdr + 1 + shift}", "values": [[f"Сумма за {n_mon} мес"]]})
     gws.batch_update(ups, value_input_option="USER_ENTERED")
-
     # ===== «Анализ и выводы»: строка месяца, ИТОГО, максимумы/минимумы, структура =====
     aws = book.worksheet(ANAL_SHEET)
     ag = aws.get(value_render_option="FORMULA")
@@ -3570,13 +3204,9 @@ def _fill_reports(month):
                 ], value_input_option="USER_ENTERED")
     except Exception as e:
         logger.error(f"analiz structure error: {e}")
-
-
 # ---------- авто-обновление «Калькуляции» и финотчёта после каждой записи ----------
 _refresh_lock = asyncio.Lock()
 _refresh_again = False
-
-
 async def _run_refresh():
     """Обновляет «Калькуляцию» и финотчёт. Параллельные вызовы совмещает
     (замок исключает гонки при вставке строк во вкладку финотчёта)."""
@@ -3602,8 +3232,6 @@ async def _run_refresh():
                 logger.error(f"auto-reports error: {e}")
             if not _refresh_again:
                 break
-
-
 def schedule_refresh():
     """Фоновое обновление через несколько секунд после записи (ответ бота не задерживает)."""
     async def _job():
@@ -3613,11 +3241,8 @@ def schedule_refresh():
         asyncio.get_running_loop().create_task(_job())
     except RuntimeError:
         pass  # нет цикла событий (например, в тестах) — пропускаем
-
-
 def main():
     app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
-
     prod_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^✍️ Ввод производства$"), manual_prod_start)],
         states={
@@ -3635,7 +3260,6 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
-
     sale_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^✍️ Ввод реализации$"), manual_sale_start)],
         states={
@@ -3652,7 +3276,6 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
-
     # Общие шаги ввода расхода — используются и из «💸 Ввод расхода»,
     # и когда фото расходного документа пришло без старта (через photo_conv).
     def _exp_states():
@@ -3669,7 +3292,6 @@ def main():
             E_SUP_NEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, exp_sup_new)],
             E_SUP_EDIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, exp_sup_edit)],
         }
-
     # NEW: диалог фото-производства с подтверждением дубля.
     # entry_point — приход фото; если дубль, переходим в PHOTO_PROD_CONFIRM и ждём Да/Нет.
     photo_conv = ConversationHandler(
@@ -3677,6 +3299,7 @@ def main():
         states={
             PHOTO_TYPE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_type_confirm)],
             PHOTO_PROD_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_prod_confirm)],
+            PHOTO_PROD_BYFRAC: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_prod_byfrac)],
             PHOTO_SALE_PAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_sale_paytype)],
             PHOTO_SALE_BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_sale_bank)],
             PHOTO_SALE_KG: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_sale_kg)],
@@ -3692,7 +3315,6 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ostatok", ostatok))
     app.add_handler(CommandHandler("last", last_records))
@@ -3706,7 +3328,6 @@ def main():
         states=_exp_states(),
         fallbacks=[CommandHandler("cancel", cancel)],
     )
-
     xlsx_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Document.FileExtension("xlsx"), handle_xlsx)],
         states={
@@ -3715,7 +3336,6 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
-
     smena_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^👷 Смена$"), smena_start)],
         states={
@@ -3726,14 +3346,12 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
-
     # «Спасательный круг»: в каждом шаге каждого диалога кнопки меню и «❌ Отмена»
     # обрабатываются первыми — незаконченный ввод сбрасывается, бот не залипает.
     _escape = MessageHandler(filters.Regex(MENU_ESCAPE_RE), conv_menu_escape)
     for _conv in (prod_conv, sale_conv, exp_conv, photo_conv, smena_conv, xlsx_conv):
         for _handlers in _conv.states.values():
             _handlers.insert(0, _escape)
-
     app.add_handler(prod_conv)
     app.add_handler(sale_conv)
     app.add_handler(exp_conv)
@@ -3741,7 +3359,6 @@ def main():
     app.add_handler(xlsx_conv)
     app.add_handler(photo_conv)  # после exp_conv: фото в режиме «Ввод расхода» ловит exp_conv
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
     if WEBHOOK_URL:
         logger.info(f"Starting webhook on port {PORT}")
         app.run_webhook(
@@ -3754,7 +3371,5 @@ def main():
     else:
         logger.info("Starting polling...")
         app.run_polling(drop_pending_updates=True)
-
-
 if __name__ == "__main__":
     main()
