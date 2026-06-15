@@ -84,6 +84,8 @@ PHOTO_PROD_BYFRAC = 52
 (S_PAID, PHOTO_SALE_PAID) = range(53, 55)
 # NEW: отметить оплату продажи кнопкой (Шаг 2)
 (OPL_PICK, OPL_DATE) = range(55, 57)
+# NEW: разбор банковской выписки целиком (приход + расход) — Фаза 1
+(STMT_BANK, STMT_CONFIRM) = range(57, 59)
 FRACTIONS = ["0-1", "1-2", "2-4", "4-6", "6-8"]
 # Заголовки листов склада (порядок колонок = порядок записи)
 PROD_HEADERS = ["Дата", "ФИО оператора", "Вес шин кг", "Мешки шт", "Нитки",
@@ -1437,6 +1439,75 @@ async def vyp_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Записано переводов группы: {len(out)}. Финотчёт обновится сам "
         f"(блок «Переводы между компаниями группы»).")
     return ConversationHandler.END
+async def _stmt_confirm_ask(update, context):
+    """Карточка-список по выписке: что запишу (приход+расход), что пропустил."""
+    d = context.user_data.get("pending_stmt", {})
+    bank = d.get("bank") or "—"
+    lines = []
+    if d.get("group_rows"):
+        lines.append("📥 Поступления (группа):")
+        for r in d["group_rows"]:
+            lines.append(f"  • {r['дата']} {r['метка']}: {r['сумма']:.0f}₸")
+    if d.get("exp_rows"):
+        lines.append("📤 Расходы (в журнал):")
+        for r in d["exp_rows"]:
+            lines.append(f"  • {r['дата']} {r['контрагент'][:22]}: {r['сумма']:.0f}₸ → {r['категория']}")
+    notes = []
+    if d.get("salary_n"):
+        notes.append(f"зарплата пропущена: {d['salary_n']} ({d['salary_sum']:.0f}₸) — ФОТ из ведомости")
+    if d.get("inc_dups") or d.get("exp_dups"):
+        notes.append(f"дубли пропущены: {d.get('inc_dups', 0) + d.get('exp_dups', 0)}")
+    if d.get("inc_other"):
+        notes.append("приход не из группы (бухгалтер): " + ", ".join(d["inc_other"][:4]))
+    txt = f"🏦 Выписка · банк: {bank}\n\n" + "\n".join(lines)
+    if notes:
+        txt += "\n\n⏭ " + "\n⏭ ".join(notes)
+    txt += ("\n\nКатегории расходов — моя догадка. Сохранить всё? "
+            "Неверную категорию потом поправишь в листе «Расходы».")
+    kb = ReplyKeyboardMarkup([["✅ Сохранить всё"], ["❌ Отмена"]],
+                             resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text(txt, reply_markup=kb)
+    return STMT_CONFIRM
+async def stmt_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    val = update.message.text.strip().lower()
+    if "евраз" in val:
+        bank = "Евразийский"
+    elif "бцк" in val or "bcc" in val:
+        bank = "БЦК"
+    else:
+        await update.message.reply_text("⚠️ Выбери: Евразийский или БЦК")
+        return STMT_BANK
+    d = context.user_data.get("pending_stmt", {})
+    d["bank"] = bank
+    if d.get("acct"):
+        try:
+            await asyncio.to_thread(add_account, d["acct"], bank)
+        except Exception as e:
+            logger.error(f"stmt add_account: {e}")
+    return await _stmt_confirm_ask(update, context)
+async def stmt_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ans = update.message.text.strip().lower()
+    d = context.user_data.pop("pending_stmt", None) or {}
+    if "сохран" not in ans and "да" not in ans:
+        await update.message.reply_text("❌ Отменено, ничего не сохранено.")
+        return ConversationHandler.END
+    bank = d.get("bank", "")
+    inc_out = [[r["дата"], r["плательщик"], r["сумма"], bank, "Перевод группы",
+                r["назначение"], r["бин"]] for r in d.get("group_rows", [])]
+    if inc_out:
+        ws = await asyncio.to_thread(get_worksheet, SHEET_INCOME, INCOME_HEADERS)
+        await asyncio.to_thread(ws.append_rows, inc_out, value_input_option="USER_ENTERED")
+    for r in d.get("exp_rows", []):
+        await asyncio.to_thread(save_expense, {
+            "дата": r["дата"], "сумма": r["сумма"], "группа": r["группа"],
+            "категория": r["категория"], "источник": bank,
+            "контрагент": r["контрагент"], "примечание": r["примечание"]})
+    if inc_out or d.get("exp_rows"):
+        schedule_refresh()
+    await update.message.reply_text(
+        f"✅ Из выписки записано: поступлений группы {len(inc_out)}, "
+        f"расходов {len(d.get('exp_rows', []))}. Финотчёт и «Калькуляция» обновятся сами.")
+    return ConversationHandler.END
 async def recognize_daily(image_bytes: bytes):
     """Распознаёт комбинированный дневной отчёт смены: производство + кто работал."""
     image_b64 = base64.b64encode(image_bytes).decode()
@@ -1610,17 +1681,21 @@ async def photo_sale_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data["банк"] = bank
     return await _photo_sale_followup(update, context)
 async def recognize_statement(image_bytes: bytes):
-    """Распознаёт банковскую выписку (фото/скрин): входящие платежи (колонка «Кредит»)."""
+    """Распознаёт банковскую выписку (фото/скрин): приход (Кредит) и расход (Дебет)."""
     image_b64 = base64.b64encode(image_bytes).decode()
     prompt = (
-        "Это банковская выписка по счёту компании (таблица платежей).\n"
+        "Это банковская выписка по счёту компании (таблица платежей за день).\n"
         "Верни ТОЛЬКО JSON без markdown:\n"
-        '{"наш_счет":"наш ИИК из шапки выписки (KZ...)",'
-        '"строки":[{"дата":"дд.мм.гггг","плательщик":"отправитель платежа",'
-        '"сумма":0,"бин":"БИН/ИИН плательщика","назначение":"назначение платежа кратко"}]}\n'
-        "Бери ТОЛЬКО ВХОДЯЩИЕ платежи — где заполнена колонка «Кредит» (деньги пришли нам). "
-        "Исходящие (колонка «Дебет») ПРОПУСКАЙ. Сумма — число из «Кредит». "
-        "«наш_счет» — ИИК нашей компании из шапки. Чего нет — пусто."
+        '{"наш_счет":"наш ИИК из шапки (KZ...)",'
+        '"поступления":[{"дата":"дд.мм.гггг","плательщик":"отправитель","сумма":0,'
+        '"бин":"БИН плательщика","назначение":"кратко"}],'
+        '"расходы":[{"дата":"дд.мм.гггг","получатель":"кому платим","сумма":0,'
+        '"бин":"БИН получателя","назначение":"назначение платежа как в выписке"}]}\n'
+        "поступления — строки, где сумма в колонке «Кредит» (деньги пришли нам). "
+        "расходы — строки, где сумма в колонке «Дебет» (деньги ушли). "
+        "Сумму бери из соответствующей колонки. «наш_счет» — ИИК нашей компании из шапки. "
+        "Назначение передавай близко к тексту выписки (комиссия → «комиссия», зарплата → "
+        "«заработной платы на картсчета», транспорт/такси → как есть). Чего нет — пусто."
     )
     return await call_claude(image_b64, prompt)
 async def detect_doc_type(image_bytes: bytes):
@@ -1742,31 +1817,78 @@ async def _dispatch_photo(update, context, photo_type, image_bytes):
             await update.message.reply_text("🏦 Распознаю банковскую выписку...")
             data = await recognize_statement(image_bytes)
             logger.info(f"Statement data: {data}")
-            acct = str(data.get("наш_счет", "")).strip().upper() if isinstance(data, dict) else ""
-            raw = data.get("строки") if isinstance(data, dict) else None
-            if not raw:
-                await update.message.reply_text(
-                    "❌ Не нашёл входящих платежей в выписке. Переснимай чётче или пришли файлом Excel.")
+            if not isinstance(data, dict):
+                await update.message.reply_text("❌ Не смог разобрать выписку. Переснимай чётче.")
                 return ConversationHandler.END
-            rows = []
-            for s in raw:
+            acct = str(data.get("наш_счет", "")).strip().upper()
+            comps = await asyncio.to_thread(get_group_companies)
+            have_inc = await asyncio.to_thread(_income_existing)
+            have_exp = await asyncio.to_thread(_expenses_existing)
+            group_rows, inc_other, inc_dups = [], set(), 0
+            for s in (data.get("поступления") or []):
                 payer = str(s.get("плательщик", "")).strip()
                 amt = parse_num(s.get("сумма", 0))
                 if not payer or not amt:
                     continue
                 dt = parse_date_or_none(str(s.get("дата", "")))
-                rows.append({
-                    "дата": date_to_str(dt) if dt else "",
-                    "плательщик": payer,
-                    "сумма": amt,
-                    "счёт": acct,
-                    "назначение": str(s.get("назначение", "")).strip()[:120],
-                    "бин": re.sub(r"\D", "", str(s.get("бин", ""))),
-                })
-            if not rows:
-                await update.message.reply_text("❌ В выписке не разобрал ни одного входящего платежа.")
+                dstr = date_to_str(dt) if dt else ""
+                binv = re.sub(r"\D", "", str(s.get("бин", "")))
+                comp = _match_group(payer, binv, comps)
+                if comp is None:
+                    inc_other.add(payer)
+                    continue
+                if (dstr, _norm_company(payer), round(amt, 2)) in have_inc:
+                    inc_dups += 1
+                    continue
+                group_rows.append({"дата": dstr, "плательщик": payer, "сумма": amt, "счёт": acct,
+                                   "назначение": str(s.get("назначение", "")).strip()[:120],
+                                   "бин": binv, "метка": comp["label"]})
+            exp_rows, exp_dups, salary_n, salary_sum = [], 0, 0, 0.0
+            for s in (data.get("расходы") or []):
+                amt = parse_num(s.get("сумма", 0))
+                if not amt:
+                    continue
+                rcpt = str(s.get("получатель", "")).strip()
+                naz = str(s.get("назначение", "")).strip()
+                grp, cat, is_sal = _categorize_expense(naz)
+                if is_sal:
+                    salary_n += 1
+                    salary_sum += amt
+                    continue
+                dt = parse_date_or_none(str(s.get("дата", "")))
+                dstr = date_to_str(dt) if dt else ""
+                if (dstr, round(amt, 2), _norm_company(rcpt)) in have_exp:
+                    exp_dups += 1
+                    continue
+                exp_rows.append({"дата": dstr, "сумма": amt, "группа": grp, "категория": cat,
+                                 "контрагент": rcpt, "примечание": naz[:120]})
+            if not group_rows and not exp_rows:
+                msg = "📑 В выписке нового нет."
+                ex = []
+                if inc_dups or exp_dups:
+                    ex.append(f"дубли пропущены: {inc_dups + exp_dups}")
+                if salary_n:
+                    ex.append(f"зарплата пропущена: {salary_n} ({salary_sum:.0f}₸)")
+                if inc_other:
+                    ex.append("приход не из группы: " + ", ".join(sorted(inc_other)[:4]))
+                if ex:
+                    msg += "\n⏭ " + "\n⏭ ".join(ex)
+                await update.message.reply_text(msg)
                 return ConversationHandler.END
-            return await _process_statement_rows(update, context, rows)
+            accounts = await asyncio.to_thread(get_accounts)
+            bank = accounts.get(acct) if acct else None
+            context.user_data["pending_stmt"] = {
+                "acct": acct, "bank": bank, "group_rows": group_rows, "exp_rows": exp_rows,
+                "inc_dups": inc_dups, "exp_dups": exp_dups, "salary_n": salary_n,
+                "salary_sum": salary_sum, "inc_other": sorted(inc_other)}
+            if not bank:
+                kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["❌ Отмена"]],
+                                         resize_keyboard=True, one_time_keyboard=True)
+                await update.message.reply_text(
+                    f"🏦 Счёт {acct or '(не распознан)'} незнаком. Это какой наш банк? (запомню)",
+                    reply_markup=kb)
+                return STMT_BANK
+            return await _stmt_confirm_ask(update, context)
         if photo_type == "daily":
             await update.message.reply_text("📋 Распознаю дневной отчёт смены...")
             data = await recognize_daily(image_bytes)
@@ -2185,6 +2307,40 @@ EXPENSE_GROUPS = {
 EXPENSE_SOURCES = ["Евразийский", "БЦК", "Касса 1", "Касса 2", "Неденежный"]
 def get_expenses_ws():
     return get_worksheet(SHEET_EXPENSES, EXPENSE_HEADERS)
+def _categorize_expense(naznachenie):
+    """По назначению платежа из выписки -> (группа, категория, is_salary).
+    is_salary=True -> зарплата, её ПРОПУСКАЕМ (ФОТ берём из ведомости)."""
+    n = str(naznachenie).lower()
+    if any(k in n for k in ("картсчет", "карт-счет", "заработн", "зароботн", "зарплат", "сотрудник")):
+        return (None, None, True)
+    if "комисси" in n:
+        return ("Администрация", "Услуги банка", False)
+    if any(k in n for k in ("такси", "транспорт", "перевозк", "логист", "сухопутн", "доставк")):
+        return ("Производство", "Транспорт и логистика", False)
+    if any(k in n for k in ("лизинг", "фрп", "фонд развития")):
+        return ("Капзатраты", "Лизинг (основной долг)", False)
+    if any(k in n for k in ("гсм", "топлив", "бензин", "дизел", "солярк")):
+        return ("Производство", "ГСМ", False)
+    if any(k in n for k in ("материал", "запчаст", "запасн")):
+        return ("Производство", "Материалы и запчасти", False)
+    if "электроэнерг" in n or "энергоснаб" in n:
+        return ("Производство", "Электроэнергия", False)
+    if "налог" in n:
+        return ("Администрация", "Налоги", False)
+    return ("Администрация", "Прочие административные", False)  # догадка по умолчанию
+def _expenses_existing():
+    """Ключи (дата, сумма, контрагент) уже внесённых расходов — для дедупликации с выпиской."""
+    have = set()
+    try:
+        for r in get_expenses_ws().get_all_values()[1:]:
+            if len(r) < 7:
+                r = r + [""] * (7 - len(r))
+            dt = parse_date_or_none(r[0])
+            have.add((date_to_str(dt) if dt else str(r[0]).strip(),
+                      round(parse_num(r[1]), 2), _norm_company(r[6])))
+    except Exception as e:
+        logger.error(f"expenses_existing: {e}")
+    return have
 def _source_to_paytype(src):
     if src in ("Евразийский", "БЦК"):
         return "Безналичный"
@@ -3497,6 +3653,8 @@ def main():
             DAILY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, daily_confirm)],
             VYP_BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, vyp_bank)],
             VYP_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, vyp_confirm)],
+            STMT_BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, stmt_bank)],
+            STMT_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, stmt_confirm)],
             **_exp_states(),  # фото-расход продолжает шаги расхода прямо здесь
         },
         fallbacks=[CommandHandler("cancel", cancel)],
