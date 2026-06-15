@@ -85,7 +85,7 @@ PHOTO_PROD_BYFRAC = 52
 # NEW: отметить оплату продажи кнопкой (Шаг 2)
 (OPL_PICK, OPL_DATE) = range(55, 57)
 # NEW: разбор банковской выписки целиком (приход + расход) — Фаза 1
-(STMT_BANK, STMT_CONFIRM) = range(57, 59)
+(STMT_BANK, STMT_CONFIRM, STMT_FOT) = range(57, 60)
 FRACTIONS = ["0-1", "1-2", "2-4", "4-6", "6-8"]
 # Заголовки листов склада (порядок колонок = порядок записи)
 PROD_HEADERS = ["Дата", "ФИО оператора", "Вес шин кг", "Мешки шт", "Нитки",
@@ -1485,9 +1485,13 @@ async def _stmt_confirm_ask(update, context):
         lines.append("💳 Закрою оплату реализаций:")
         for r in d["pay_rows"]:
             lines.append(f"  • {r['buyer'][:22]}: {r['сумма']:.0f}₸ (продажа {r['sale_date']} → оплачено {r['pay_date']})")
+    if d.get("salary_rows"):
+        lines.append("👷 Зарплата (ФОТ) — в журнал:")
+        for r in d["salary_rows"]:
+            t = {"административный": "АУП", "производственный": "Производство"}.get(r.get("type"), "?")
+            who = r.get("fio") or r.get("получатель") or "—"
+            lines.append(f"  • {who[:22]}: {r['сумма']:.0f}₸ → ФОТ {t}")
     notes = []
-    if d.get("salary_n"):
-        notes.append(f"зарплата пропущена: {d['salary_n']} ({d['salary_sum']:.0f}₸) — ФОТ из ведомости")
     if d.get("inc_dups") or d.get("exp_dups"):
         notes.append(f"дубли пропущены: {d.get('inc_dups', 0) + d.get('exp_dups', 0)}")
     if d.get("inc_other"):
@@ -1517,7 +1521,7 @@ async def stmt_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.to_thread(add_account, d["acct"], bank)
         except Exception as e:
             logger.error(f"stmt add_account: {e}")
-    return await _stmt_confirm_ask(update, context)
+    return await _stmt_next_step(update, context)
 async def stmt_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ans = update.message.text.strip().lower()
     d = context.user_data.pop("pending_stmt", None) or {}
@@ -1535,6 +1539,18 @@ async def stmt_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "дата": r["дата"], "сумма": r["сумма"], "группа": r["группа"],
             "категория": r["категория"], "источник": bank,
             "контрагент": r["контрагент"], "примечание": r["примечание"]})
+    # зарплата (ФОТ) — пишем в «Расходы» по статьям из реестра
+    fot_n, fot_skip = 0, 0
+    for r in d.get("salary_rows", []):
+        if not r.get("type"):
+            fot_skip += 1
+            continue
+        await asyncio.to_thread(save_expense, {
+            "дата": r["дата"], "сумма": r["сумма"], "группа": "ФОТ",
+            "категория": FOT_CAT.get(r["type"], "ФОТ"), "источник": bank,
+            "контрагент": r.get("fio") or r.get("получатель", ""),
+            "примечание": r.get("назначение", "")})
+        fot_n += 1
     pay_rows = d.get("pay_rows", [])
     paid_n = 0
     if pay_rows:
@@ -1545,10 +1561,14 @@ async def stmt_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 paid_n += 1
             except Exception as e:
                 logger.error(f"stmt pay mark error (row {r.get('row')}): {e}")
-    if inc_out or d.get("exp_rows") or paid_n:
+    if inc_out or d.get("exp_rows") or paid_n or fot_n:
         schedule_refresh()
     msg = (f"✅ Из выписки записано: поступлений группы {len(inc_out)}, "
            f"расходов {len(d.get('exp_rows', []))}.")
+    if fot_n:
+        msg += f" Зарплата (ФОТ) разнесена: {fot_n}."
+    if fot_skip:
+        msg += f" Не определена категория ФОТ: {fot_skip} (пропустил)."
     if paid_n:
         msg += f" Закрыто оплат реализаций: {paid_n}."
     msg += " Финотчёт и «Калькуляция» обновятся сами."
@@ -1736,7 +1756,8 @@ async def recognize_statement(image_bytes: bytes, media_type: str = "image/jpeg"
         '"поступления":[{"дата":"дд.мм.гггг","плательщик":"отправитель","сумма":0,'
         '"бин":"БИН плательщика","назначение":"кратко"}],'
         '"расходы":[{"дата":"дд.мм.гггг","получатель":"кому платим","сумма":0,'
-        '"бин":"БИН получателя","назначение":"назначение платежа как в выписке"}]}\n'
+        '"бин":"БИН получателя","иик":"ИИК получателя (KZ..., из колонки ИИК)",'
+        '"назначение":"назначение платежа как в выписке"}]}\n'
         "поступления — строки, где сумма в колонке «Кредит» (деньги пришли нам). "
         "расходы — строки, где сумма в колонке «Дебет» (деньги ушли). "
         "Сумму бери из соответствующей колонки. «наш_счет» — ИИК нашей компании из шапки. "
@@ -1882,6 +1903,7 @@ async def _process_statement_data(update, context, data):
     have_inc = await asyncio.to_thread(_income_existing)
     have_exp = await asyncio.to_thread(_expenses_existing)
     unpaid = await asyncio.to_thread(_unpaid_sales)
+    fot_reg = await asyncio.to_thread(_fot_registry)
     group_rows, inc_other, inc_dups = [], set(), 0
     pay_rows, used_rows = [], set()
     for s in (data.get("поступления") or []):
@@ -1916,32 +1938,39 @@ async def _process_statement_data(update, context, data):
                              "pay_date": dstr or datetime.now().strftime("%d.%m.%Y")})
         else:
             inc_other.add(payer)
-    exp_rows, exp_dups, salary_n, salary_sum = [], 0, 0, 0.0
+    exp_rows, exp_dups = [], 0
+    salary_rows = []  # зарплата: разносим по реестру ФОТ (АУП/производство)
     for s in (data.get("расходы") or []):
         amt = parse_num(s.get("сумма", 0))
         if not amt:
             continue
         rcpt = str(s.get("получатель", "")).strip()
         naz = str(s.get("назначение", "")).strip()
-        grp, cat, is_sal = _categorize_expense(naz)
-        if is_sal:
-            salary_n += 1
-            salary_sum += amt
-            continue
         dt = parse_date_or_none(str(s.get("дата", "")))
         dstr = date_to_str(dt) if dt else ""
+        grp, cat, is_sal = _categorize_expense(naz)
+        if is_sal:
+            iik = _norm_iik(s.get("иик", ""))
+            reg = fot_reg.get(iik)
+            fio = reg["fio"] if reg else ""
+            ftype = reg["type"] if reg else None
+            who = fio or rcpt
+            if (dstr, round(amt, 2), _norm_company(who)) in have_exp:
+                exp_dups += 1
+                continue
+            salary_rows.append({"дата": dstr, "сумма": amt, "иик": iik, "получатель": rcpt,
+                                "fio": fio, "type": ftype, "назначение": naz[:120]})
+            continue
         if (dstr, round(amt, 2), _norm_company(rcpt)) in have_exp:
             exp_dups += 1
             continue
         exp_rows.append({"дата": dstr, "сумма": amt, "группа": grp, "категория": cat,
                          "контрагент": rcpt, "примечание": naz[:120]})
-    if not group_rows and not exp_rows and not pay_rows:
+    if not group_rows and not exp_rows and not pay_rows and not salary_rows:
         msg = "📑 В выписке нового нет."
         ex = []
         if inc_dups or exp_dups:
             ex.append(f"дубли пропущены: {inc_dups + exp_dups}")
-        if salary_n:
-            ex.append(f"зарплата пропущена: {salary_n} ({salary_sum:.0f}₸)")
         if inc_other:
             ex.append("приход не из группы: " + ", ".join(sorted(inc_other)[:4]))
         if ex:
@@ -1950,18 +1979,63 @@ async def _process_statement_data(update, context, data):
         return ConversationHandler.END
     accounts = await asyncio.to_thread(get_accounts)
     bank = accounts.get(acct) if acct else None
+    # очередь зарплатных счетов, которых нет в реестре — спросим АУП/производство
+    fot_queue = []
+    seen_q = set()
+    for r in salary_rows:
+        if r["type"] is None and r["iik"] not in seen_q:
+            seen_q.add(r["iik"])
+            fot_queue.append({"иик": r["iik"], "получатель": r["получатель"]})
     context.user_data["pending_stmt"] = {
         "acct": acct, "bank": bank, "group_rows": group_rows, "exp_rows": exp_rows,
-        "pay_rows": pay_rows, "inc_dups": inc_dups, "exp_dups": exp_dups, "salary_n": salary_n,
-        "salary_sum": salary_sum, "inc_other": sorted(inc_other)}
-    if not bank:
+        "pay_rows": pay_rows, "salary_rows": salary_rows, "fot_queue": fot_queue,
+        "inc_dups": inc_dups, "exp_dups": exp_dups, "inc_other": sorted(inc_other)}
+    return await _stmt_next_step(update, context)
+async def _stmt_next_step(update, context):
+    """Шаги выписки по очереди: банк → неизвестные счета ФОТ → карточка-подтверждение."""
+    d = context.user_data.get("pending_stmt", {})
+    if not d.get("bank"):
         kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["❌ Отмена"]],
                                  resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text(
-            f"🏦 Счёт {acct or '(не распознан)'} незнаком. Это какой наш банк? (запомню)",
+            f"🏦 Счёт {d.get('acct') or '(не распознан)'} незнаком. Это какой наш банк? (запомню)",
             reply_markup=kb)
         return STMT_BANK
+    if d.get("fot_queue"):
+        q = d["fot_queue"][0]
+        kb = ReplyKeyboardMarkup([["🏢 АУП", "🏭 Производственный"], ["❌ Отмена"]],
+                                 resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text(
+            f"👷 Зарплата на новый счёт `{q['иик']}` "
+            f"({q['получатель'] or 'получатель не распознан'}).\n"
+            "Это ФОТ административный (АУП) или производственный? Запомню в реестр.",
+            reply_markup=kb, parse_mode="Markdown")
+        return STMT_FOT
     return await _stmt_confirm_ask(update, context)
+async def stmt_fot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    val = update.message.text.strip().lower()
+    if "ауп" in val or "админ" in val:
+        ftype = "административный"
+    elif "произв" in val:
+        ftype = "производственный"
+    else:
+        await update.message.reply_text("⚠️ Выбери: 🏢 АУП или 🏭 Производственный")
+        return STMT_FOT
+    d = context.user_data.get("pending_stmt", {})
+    queue = d.get("fot_queue", [])
+    if not queue:
+        return await _stmt_next_step(update, context)
+    q = queue.pop(0)
+    iik = q["иик"]
+    fio = q.get("получатель", "")
+    # проставляем тип всем зарплатным строкам с этим счётом + пишем в реестр
+    for r in d.get("salary_rows", []):
+        if r["iik"] == iik and r["type"] is None:
+            r["type"] = ftype
+            if not r.get("fio"):
+                r["fio"] = fio
+    await asyncio.to_thread(_fot_registry_add, iik, fio, ftype)
+    return await _stmt_next_step(update, context)
 def _parse_statement_excel(content, is_xls):
     """Разбирает банковскую выписку из Excel (.xls через xlrd / .xlsx через openpyxl).
     Колонки Евразийского: Дата | Отправитель/Получатель | ИИН/БИН | Дебет | Кредит | Назначение.
@@ -2008,6 +2082,8 @@ def _parse_statement_excel(content, is_xls):
                     col["дата"] = j
                 elif ("отправитель" in v or "получатель" in v) and "имя" not in col:
                     col["имя"] = j
+                elif v.strip() == "иик" and "иик" not in col:
+                    col["иик"] = j
                 elif ("иин" in v or "бин" in v) and "бин" not in col:
                     col["бин"] = j
                 elif v.startswith("дебет"):
@@ -2029,11 +2105,14 @@ def _parse_statement_excel(content, is_xls):
             return cs(row[j]) if (j is not None and j < len(row)) else ""
         name = g("имя"); naz = g("назначение"); binv = re.sub(r"\D", "", g("бин"))
         date = g("дата")
+        m_iik = re.search(r"KZ[0-9A-Z]{15,22}", g("иик").upper())
+        iik = m_iik.group(0) if m_iik else ""
         cred = parse_num(g("кредит")); deb = parse_num(g("дебет"))
         if cred:
             pos.append({"дата": date, "плательщик": name, "сумма": cred, "бин": binv, "назначение": naz})
         elif deb:
-            rash.append({"дата": date, "получатель": name, "сумма": deb, "бин": binv, "назначение": naz})
+            rash.append({"дата": date, "получатель": name, "сумма": deb, "бин": binv,
+                         "иик": iik, "назначение": naz})
     return {"наш_счет": acct, "поступления": pos, "расходы": rash}
 async def _dispatch_photo(update, context, photo_type, image_bytes, media_type="image/jpeg"):
     """Распознаёт и сохраняет документ по подтверждённому типу (фото или PDF)."""
@@ -2495,6 +2574,51 @@ def _expenses_existing():
     except Exception as e:
         logger.error(f"expenses_existing: {e}")
     return have
+# --- Реестр ФОТ: какой счёт-получатель зарплаты к какой категории относится ---
+SHEET_FOT = "Реестр ФОТ"
+FOT_HEADERS = ["Счёт (ИИК)", "ФИО", "Тип (АУП/Производство)"]
+# Сид: известные счета (бот всё равно дополняет реестр на ходу).
+FOT_SEED = {
+    "KZ3194800KZT28700011": ("Ишбулатов Р.Я.", "административный"),
+    "KZ24722S000000686267": ("Шалабаев С.", "производственный"),
+}
+FOT_CAT = {"административный": "ФОТ административный", "производственный": "ФОТ производственный"}
+def _norm_iik(s):
+    return re.sub(r"\s", "", str(s or "")).upper()
+def _fot_type_norm(t):
+    t = str(t or "").strip().lower()
+    if "ауп" in t or "админ" in t:
+        return "административный"
+    if "произв" in t:
+        return "производственный"
+    return ""
+def _fot_registry():
+    """{ИИК(норм): {'fio':.., 'type':'административный'|'производственный'}} — сид + лист «Реестр ФОТ»."""
+    reg = {}
+    for iik, (fio, t) in FOT_SEED.items():
+        reg[_norm_iik(iik)] = {"fio": fio, "type": t}
+    try:
+        for r in get_worksheet(SHEET_FOT, FOT_HEADERS).get_all_values()[1:]:
+            if len(r) < 3:
+                r = r + [""] * (3 - len(r))
+            iik = _norm_iik(r[0])
+            if not iik.startswith("KZ"):
+                continue
+            t = _fot_type_norm(r[2])
+            if not t:
+                continue
+            reg[iik] = {"fio": str(r[1]).strip(), "type": t}
+    except Exception as e:
+        logger.error(f"fot_registry: {e}")
+    return reg
+def _fot_registry_add(iik, fio, ftype):
+    """Добавить счёт в лист «Реестр ФОТ» (тип — 'административный'/'производственный')."""
+    try:
+        ws = get_worksheet(SHEET_FOT, FOT_HEADERS)
+        label = "АУП" if ftype == "административный" else "Производство"
+        ws.append_row([_norm_iik(iik), str(fio or ""), label], value_input_option="USER_ENTERED")
+    except Exception as e:
+        logger.error(f"fot_registry_add: {e}")
 def _source_to_paytype(src):
     if src in ("Евразийский", "БЦК"):
         return "Безналичный"
@@ -3809,6 +3933,7 @@ def main():
             VYP_BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, vyp_bank)],
             VYP_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, vyp_confirm)],
             STMT_BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, stmt_bank)],
+            STMT_FOT: [MessageHandler(filters.TEXT & ~filters.COMMAND, stmt_fot)],
             STMT_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, stmt_confirm)],
             **_exp_states(),  # фото-расход продолжает шаги расхода прямо здесь
         },
@@ -3833,6 +3958,7 @@ def main():
             filters.Document.FileExtension("xlsx") | filters.Document.FileExtension("xls"), handle_xlsx)],
         states={
             STMT_BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, stmt_bank)],
+            STMT_FOT: [MessageHandler(filters.TEXT & ~filters.COMMAND, stmt_fot)],
             STMT_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, stmt_confirm)],
             VYP_BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, vyp_bank)],
             VYP_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, vyp_confirm)],
