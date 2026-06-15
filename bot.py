@@ -2593,21 +2593,28 @@ def _fot_type_norm(t):
         return "производственный"
     return ""
 def _fot_registry():
-    """{ИИК(норм): {'fio':.., 'type':'административный'|'производственный'}} — сид + лист «Реестр ФОТ»."""
+    """{ИИК(норм): {'fio':.., 'type':'административный'|'производственный'}} — сид + лист «Реестр ФОТ».
+    Стартовые счета (FOT_SEED) дописываются в лист, чтобы их было видно и можно было править."""
     reg = {}
     for iik, (fio, t) in FOT_SEED.items():
         reg[_norm_iik(iik)] = {"fio": fio, "type": t}
     try:
+        present = set()
         for r in get_worksheet(SHEET_FOT, FOT_HEADERS).get_all_values()[1:]:
             if len(r) < 3:
                 r = r + [""] * (3 - len(r))
             iik = _norm_iik(r[0])
             if not iik.startswith("KZ"):
                 continue
+            present.add(iik)
             t = _fot_type_norm(r[2])
             if not t:
                 continue
             reg[iik] = {"fio": str(r[1]).strip(), "type": t}
+        # стартовые счета, которых ещё нет в листе, — дописываем (одноразово)
+        for iik, (fio, t) in FOT_SEED.items():
+            if _norm_iik(iik) not in present:
+                _fot_registry_add(iik, fio, t)
     except Exception as e:
         logger.error(f"fot_registry: {e}")
     return reg
