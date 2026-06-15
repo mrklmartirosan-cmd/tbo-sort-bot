@@ -1333,26 +1333,32 @@ def _parse_bank_xlsx(content):
         })
     return out
 async def handle_xlsx(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Excel-файл в чате: выписка входящих платежей → переводы группы в «Поступления»."""
+    """Excel-файл (.xls/.xlsx): банковская выписка → приход + расход (как фото/PDF)."""
     if not is_allowed(update):
         await update.message.reply_text("⛔ Нет доступа.")
         return ConversationHandler.END
-    await update.message.reply_text("📑 Получил Excel, разбираю...")
+    await update.message.reply_text("📑 Получил Excel, разбираю выписку...")
+    doc = update.message.document
+    is_xls = str(doc.file_name or "").lower().endswith(".xls")
     try:
-        doc = update.message.document
         f = await context.bot.get_file(doc.file_id)
         content = bytes(await f.download_as_bytearray())
-        rows = await asyncio.to_thread(_parse_bank_xlsx, content)
-    except Exception as e:
-        logger.error(f"xlsx parse error: {e}")
-        await update.message.reply_text(f"❌ Не смог разобрать файл: {e}")
-        return ConversationHandler.END
-    if rows is None:
+        data = await asyncio.to_thread(_parse_statement_excel, content, is_xls)
+    except ModuleNotFoundError:
         await update.message.reply_text(
-            "❌ Не нашёл колонки банковской выписки (Плательщик, Сумма, Дата...). "
-            "Пока умею только выписку входящих платежей.")
+            "❌ Для старого формата .xls нужна библиотека xlrd (добавь строкой в requirements.txt). "
+            "Пока пришли выписку PDF или скрином.")
         return ConversationHandler.END
-    return await _process_statement_rows(update, context, rows)
+    except Exception as e:
+        logger.error(f"excel parse error: {e}")
+        await update.message.reply_text(f"❌ Не смог разобрать Excel: {e}. Пришли PDF или скрин.")
+        return ConversationHandler.END
+    if data is None:
+        await update.message.reply_text(
+            "❌ Не нашёл таблицу выписки (Дата / Дебет / Кредит / Назначение). "
+            "Проверь, что это банковская выписка, или пришли PDF/скрин.")
+        return ConversationHandler.END
+    return await _process_statement_data(update, context, data)
 async def _process_statement_rows(update, context, rows):
     """Общая обработка строк выписки (из Excel / фото / PDF): берёт переводы компаний группы,
     дедуп, спрашивает банк для незнакомого счёта, подтверждает и пишет в «Поступления»."""
@@ -1830,6 +1836,154 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Не смог скачать PDF: {e}. Пришли скрином или Excel.")
         return ConversationHandler.END
     return await _dispatch_photo(update, context, "statement", content, "application/pdf")
+async def _process_statement_data(update, context, data):
+    """Общая обработка выписки (из фото/PDF/Excel): приход группы → «Поступления»,
+    расход → журнал «Расходы» (категории, пропуск зарплаты, дедуп). Карточка-список на подтверждение."""
+    if not isinstance(data, dict):
+        await update.message.reply_text("❌ Не смог разобрать выписку.")
+        return ConversationHandler.END
+    acct = str(data.get("наш_счет", "")).strip().upper()
+    comps = await asyncio.to_thread(get_group_companies)
+    have_inc = await asyncio.to_thread(_income_existing)
+    have_exp = await asyncio.to_thread(_expenses_existing)
+    group_rows, inc_other, inc_dups = [], set(), 0
+    for s in (data.get("поступления") or []):
+        payer = str(s.get("плательщик", "")).strip()
+        amt = parse_num(s.get("сумма", 0))
+        if not payer or not amt:
+            continue
+        dt = parse_date_or_none(str(s.get("дата", "")))
+        dstr = date_to_str(dt) if dt else ""
+        binv = re.sub(r"\D", "", str(s.get("бин", "")))
+        comp = _match_group(payer, binv, comps)
+        if comp is None:
+            inc_other.add(payer)
+            continue
+        if (dstr, _norm_company(payer), round(amt, 2)) in have_inc:
+            inc_dups += 1
+            continue
+        group_rows.append({"дата": dstr, "плательщик": payer, "сумма": amt, "счёт": acct,
+                           "назначение": str(s.get("назначение", "")).strip()[:120],
+                           "бин": binv, "метка": comp["label"]})
+    exp_rows, exp_dups, salary_n, salary_sum = [], 0, 0, 0.0
+    for s in (data.get("расходы") or []):
+        amt = parse_num(s.get("сумма", 0))
+        if not amt:
+            continue
+        rcpt = str(s.get("получатель", "")).strip()
+        naz = str(s.get("назначение", "")).strip()
+        grp, cat, is_sal = _categorize_expense(naz)
+        if is_sal:
+            salary_n += 1
+            salary_sum += amt
+            continue
+        dt = parse_date_or_none(str(s.get("дата", "")))
+        dstr = date_to_str(dt) if dt else ""
+        if (dstr, round(amt, 2), _norm_company(rcpt)) in have_exp:
+            exp_dups += 1
+            continue
+        exp_rows.append({"дата": dstr, "сумма": amt, "группа": grp, "категория": cat,
+                         "контрагент": rcpt, "примечание": naz[:120]})
+    if not group_rows and not exp_rows:
+        msg = "📑 В выписке нового нет."
+        ex = []
+        if inc_dups or exp_dups:
+            ex.append(f"дубли пропущены: {inc_dups + exp_dups}")
+        if salary_n:
+            ex.append(f"зарплата пропущена: {salary_n} ({salary_sum:.0f}₸)")
+        if inc_other:
+            ex.append("приход не из группы: " + ", ".join(sorted(inc_other)[:4]))
+        if ex:
+            msg += "\n⏭ " + "\n⏭ ".join(ex)
+        await update.message.reply_text(msg)
+        return ConversationHandler.END
+    accounts = await asyncio.to_thread(get_accounts)
+    bank = accounts.get(acct) if acct else None
+    context.user_data["pending_stmt"] = {
+        "acct": acct, "bank": bank, "group_rows": group_rows, "exp_rows": exp_rows,
+        "inc_dups": inc_dups, "exp_dups": exp_dups, "salary_n": salary_n,
+        "salary_sum": salary_sum, "inc_other": sorted(inc_other)}
+    if not bank:
+        kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["❌ Отмена"]],
+                                 resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text(
+            f"🏦 Счёт {acct or '(не распознан)'} незнаком. Это какой наш банк? (запомню)",
+            reply_markup=kb)
+        return STMT_BANK
+    return await _stmt_confirm_ask(update, context)
+def _parse_statement_excel(content, is_xls):
+    """Разбирает банковскую выписку из Excel (.xls через xlrd / .xlsx через openpyxl).
+    Колонки Евразийского: Дата | Отправитель/Получатель | ИИН/БИН | Дебет | Кредит | Назначение.
+    Возвращает {наш_счет, поступления[], расходы[]} (как recognize_statement) или None."""
+    if is_xls:
+        import xlrd  # нужен в requirements.txt (xlrd) — ставится на Railway при сборке
+        wb = xlrd.open_workbook(file_contents=content)
+        sh = wb.sheet_by_index(0)
+        grid = [[sh.cell_value(r, c) for c in range(sh.ncols)] for r in range(sh.nrows)]
+    else:
+        wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
+        ws = wb.worksheets[0]
+        grid = [[("" if v is None else v) for v in row] for row in ws.iter_rows(values_only=True)]
+    def cs(v):
+        if v is None:
+            return ""
+        if isinstance(v, float) and v == int(v):
+            return str(int(v))
+        return str(v).strip()
+    # наш счёт (ИИК KZ...)
+    acct = ""
+    for row in grid[:20]:
+        joined = " ".join(cs(v) for v in row)
+        if "иик" in joined.lower():
+            m = re.search(r"KZ[0-9A-Z]{15,22}", joined.upper())
+            if m:
+                acct = m.group(0)
+                break
+    if not acct:
+        for row in grid[:20]:
+            m = re.search(r"KZ[0-9A-Z]{15,22}", " ".join(cs(v) for v in row).upper())
+            if m:
+                acct = m.group(0)
+                break
+    # строка-заголовок таблицы
+    hdr_i, col = None, {}
+    for i, row in enumerate(grid):
+        low = [cs(v).lower() for v in row]
+        joined = " ".join(low)
+        if "дата" in joined and ("дебет" in joined or "кредит" in joined):
+            hdr_i = i
+            for j, v in enumerate(low):
+                if v == "дата" and "дата" not in col:
+                    col["дата"] = j
+                elif ("отправитель" in v or "получатель" in v) and "имя" not in col:
+                    col["имя"] = j
+                elif ("иин" in v or "бин" in v) and "бин" not in col:
+                    col["бин"] = j
+                elif v.startswith("дебет"):
+                    col["дебет"] = j
+                elif v.startswith("кредит"):
+                    col["кредит"] = j
+                elif "назначение" in v:
+                    col["назначение"] = j
+            break
+    if hdr_i is None or "дебет" not in col or "кредит" not in col:
+        return None
+    pos, rash = [], []
+    for row in grid[hdr_i + 1:]:
+        joined = " ".join(cs(v) for v in row).lower()
+        if "оборот" in joined or "итого документ" in joined:
+            break
+        def g(k):
+            j = col.get(k)
+            return cs(row[j]) if (j is not None and j < len(row)) else ""
+        name = g("имя"); naz = g("назначение"); binv = re.sub(r"\D", "", g("бин"))
+        date = g("дата")
+        cred = parse_num(g("кредит")); deb = parse_num(g("дебет"))
+        if cred:
+            pos.append({"дата": date, "плательщик": name, "сумма": cred, "бин": binv, "назначение": naz})
+        elif deb:
+            rash.append({"дата": date, "получатель": name, "сумма": deb, "бин": binv, "назначение": naz})
+    return {"наш_счет": acct, "поступления": pos, "расходы": rash}
 async def _dispatch_photo(update, context, photo_type, image_bytes, media_type="image/jpeg"):
     """Распознаёт и сохраняет документ по подтверждённому типу (фото или PDF)."""
     try:
@@ -1837,78 +1991,7 @@ async def _dispatch_photo(update, context, photo_type, image_bytes, media_type="
             await update.message.reply_text("🏦 Распознаю банковскую выписку...")
             data = await recognize_statement(image_bytes, media_type)
             logger.info(f"Statement data: {data}")
-            if not isinstance(data, dict):
-                await update.message.reply_text("❌ Не смог разобрать выписку. Переснимай чётче.")
-                return ConversationHandler.END
-            acct = str(data.get("наш_счет", "")).strip().upper()
-            comps = await asyncio.to_thread(get_group_companies)
-            have_inc = await asyncio.to_thread(_income_existing)
-            have_exp = await asyncio.to_thread(_expenses_existing)
-            group_rows, inc_other, inc_dups = [], set(), 0
-            for s in (data.get("поступления") or []):
-                payer = str(s.get("плательщик", "")).strip()
-                amt = parse_num(s.get("сумма", 0))
-                if not payer or not amt:
-                    continue
-                dt = parse_date_or_none(str(s.get("дата", "")))
-                dstr = date_to_str(dt) if dt else ""
-                binv = re.sub(r"\D", "", str(s.get("бин", "")))
-                comp = _match_group(payer, binv, comps)
-                if comp is None:
-                    inc_other.add(payer)
-                    continue
-                if (dstr, _norm_company(payer), round(amt, 2)) in have_inc:
-                    inc_dups += 1
-                    continue
-                group_rows.append({"дата": dstr, "плательщик": payer, "сумма": amt, "счёт": acct,
-                                   "назначение": str(s.get("назначение", "")).strip()[:120],
-                                   "бин": binv, "метка": comp["label"]})
-            exp_rows, exp_dups, salary_n, salary_sum = [], 0, 0, 0.0
-            for s in (data.get("расходы") or []):
-                amt = parse_num(s.get("сумма", 0))
-                if not amt:
-                    continue
-                rcpt = str(s.get("получатель", "")).strip()
-                naz = str(s.get("назначение", "")).strip()
-                grp, cat, is_sal = _categorize_expense(naz)
-                if is_sal:
-                    salary_n += 1
-                    salary_sum += amt
-                    continue
-                dt = parse_date_or_none(str(s.get("дата", "")))
-                dstr = date_to_str(dt) if dt else ""
-                if (dstr, round(amt, 2), _norm_company(rcpt)) in have_exp:
-                    exp_dups += 1
-                    continue
-                exp_rows.append({"дата": dstr, "сумма": amt, "группа": grp, "категория": cat,
-                                 "контрагент": rcpt, "примечание": naz[:120]})
-            if not group_rows and not exp_rows:
-                msg = "📑 В выписке нового нет."
-                ex = []
-                if inc_dups or exp_dups:
-                    ex.append(f"дубли пропущены: {inc_dups + exp_dups}")
-                if salary_n:
-                    ex.append(f"зарплата пропущена: {salary_n} ({salary_sum:.0f}₸)")
-                if inc_other:
-                    ex.append("приход не из группы: " + ", ".join(sorted(inc_other)[:4]))
-                if ex:
-                    msg += "\n⏭ " + "\n⏭ ".join(ex)
-                await update.message.reply_text(msg)
-                return ConversationHandler.END
-            accounts = await asyncio.to_thread(get_accounts)
-            bank = accounts.get(acct) if acct else None
-            context.user_data["pending_stmt"] = {
-                "acct": acct, "bank": bank, "group_rows": group_rows, "exp_rows": exp_rows,
-                "inc_dups": inc_dups, "exp_dups": exp_dups, "salary_n": salary_n,
-                "salary_sum": salary_sum, "inc_other": sorted(inc_other)}
-            if not bank:
-                kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["❌ Отмена"]],
-                                         resize_keyboard=True, one_time_keyboard=True)
-                await update.message.reply_text(
-                    f"🏦 Счёт {acct or '(не распознан)'} незнаком. Это какой наш банк? (запомню)",
-                    reply_markup=kb)
-                return STMT_BANK
-            return await _stmt_confirm_ask(update, context)
+            return await _process_statement_data(update, context, data)
         if photo_type == "daily":
             await update.message.reply_text("📋 Распознаю дневной отчёт смены...")
             data = await recognize_daily(image_bytes)
@@ -3695,8 +3778,11 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     xlsx_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Document.FileExtension("xlsx"), handle_xlsx)],
+        entry_points=[MessageHandler(
+            filters.Document.FileExtension("xlsx") | filters.Document.FileExtension("xls"), handle_xlsx)],
         states={
+            STMT_BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, stmt_bank)],
+            STMT_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, stmt_confirm)],
             VYP_BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, vyp_bank)],
             VYP_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, vyp_confirm)],
         },
