@@ -358,8 +358,14 @@ def calc_stock():
     stock = {k: income[k] - outcome[k] for k in income}
     return income, outcome, stock
 # ---------- Распознавание фото через Claude ----------
-async def call_claude(image_b64: str, prompt: str):
-    async with httpx.AsyncClient(timeout=60) as client:
+async def call_claude(media_b64: str, prompt: str, media_type: str = "image/jpeg"):
+    if media_type == "application/pdf":
+        block = {"type": "document",
+                 "source": {"type": "base64", "media_type": "application/pdf", "data": media_b64}}
+    else:
+        block = {"type": "image",
+                 "source": {"type": "base64", "media_type": media_type, "data": media_b64}}
+    async with httpx.AsyncClient(timeout=120) as client:
         response = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -370,13 +376,7 @@ async def call_claude(image_b64: str, prompt: str):
             json={
                 "model": "claude-opus-4-5",
                 "max_tokens": 2000,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
-                        {"type": "text", "text": prompt}
-                    ]
-                }]
+                "messages": [{"role": "user", "content": [block, {"type": "text", "text": prompt}]}]
             }
         )
         result = response.json()
@@ -1685,8 +1685,8 @@ async def photo_sale_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = context.user_data.get("pending_sale", {})
     data["банк"] = bank
     return await _photo_sale_followup(update, context)
-async def recognize_statement(image_bytes: bytes):
-    """Распознаёт банковскую выписку (фото/скрин): приход (Кредит) и расход (Дебет)."""
+async def recognize_statement(image_bytes: bytes, media_type: str = "image/jpeg"):
+    """Распознаёт банковскую выписку (фото/скрин/PDF): приход (Кредит) и расход (Дебет)."""
     image_b64 = base64.b64encode(image_bytes).decode()
     prompt = (
         "Это банковская выписка по счёту компании (таблица платежей за день).\n"
@@ -1702,7 +1702,7 @@ async def recognize_statement(image_bytes: bytes):
         "Назначение передавай близко к тексту выписки (комиссия → «комиссия», зарплата → "
         "«заработной платы на картсчета», транспорт/такси → как есть). Чего нет — пусто."
     )
-    return await call_claude(image_b64, prompt)
+    return await call_claude(image_b64, prompt, media_type)
 async def detect_doc_type(image_bytes: bytes):
     """Определяет по фото: накладная-реализация, отчёт производства или расходный документ."""
     image_b64 = base64.b64encode(image_bytes).decode()
@@ -1815,12 +1815,27 @@ async def photo_type_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ Не смог скачать фото. Пришли заново.")
         return ConversationHandler.END
     return await _dispatch_photo(update, context, photo_type, image_bytes)
-async def _dispatch_photo(update, context, photo_type, image_bytes):
-    """Распознаёт и сохраняет фото по подтверждённому типу."""
+async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """PDF-файл в чате: читаем как банковскую выписку (приход + расход) напрямую."""
+    if not is_allowed(update):
+        await update.message.reply_text("⛔ Нет доступа.")
+        return ConversationHandler.END
+    await update.message.reply_text("📑 Получил PDF, читаю банковскую выписку...")
+    try:
+        doc = update.message.document
+        f = await context.bot.get_file(doc.file_id)
+        content = bytes(await f.download_as_bytearray())
+    except Exception as e:
+        logger.error(f"handle_pdf download error: {e}")
+        await update.message.reply_text(f"❌ Не смог скачать PDF: {e}. Пришли скрином или Excel.")
+        return ConversationHandler.END
+    return await _dispatch_photo(update, context, "statement", content, "application/pdf")
+async def _dispatch_photo(update, context, photo_type, image_bytes, media_type="image/jpeg"):
+    """Распознаёт и сохраняет документ по подтверждённому типу (фото или PDF)."""
     try:
         if photo_type == "statement":
             await update.message.reply_text("🏦 Распознаю банковскую выписку...")
-            data = await recognize_statement(image_bytes)
+            data = await recognize_statement(image_bytes, media_type)
             logger.info(f"Statement data: {data}")
             if not isinstance(data, dict):
                 await update.message.reply_text("❌ Не смог разобрать выписку. Переснимай чётче.")
@@ -3639,7 +3654,8 @@ def main():
     # NEW: диалог фото-производства с подтверждением дубля.
     # entry_point — приход фото; если дубль, переходим в PHOTO_PROD_CONFIRM и ждём Да/Нет.
     photo_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.PHOTO, handle_photo)],
+        entry_points=[MessageHandler(filters.PHOTO, handle_photo),
+                      MessageHandler(filters.Document.FileExtension("pdf"), handle_pdf)],
         states={
             PHOTO_TYPE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_type_confirm)],
             PHOTO_PROD_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, photo_prod_confirm)],
