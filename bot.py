@@ -189,6 +189,24 @@ def get_production_ws():
     return get_worksheet(SHEET_PRODUCTION, PROD_HEADERS)
 def get_sales_ws():
     return get_worksheet(SHEET_SALES, SALES_HEADERS)
+def _unpaid_sales():
+    """Неоплаченные продажи (колонка J пустая): [{row, buyer, sum, date}, ...]."""
+    out = []
+    try:
+        rows = get_sales_ws().get_all_values()
+    except Exception as e:
+        logger.error(f"unpaid_sales: {e}")
+        return out
+    for i, r in enumerate(rows[1:], start=2):
+        if len(r) < 10:
+            r = r + [""] * (10 - len(r))
+        if str(r[9]).strip():
+            continue  # уже оплачено
+        buyer = str(r[1]).strip()
+        if not buyer and not parse_num(r[4]):
+            continue
+        out.append({"row": i, "buyer": buyer, "sum": parse_num(r[6]), "date": str(r[0]).strip()})
+    return out
 # ---------- Чтение/запись данных ----------
 def _fractions_signature(data):
     """NEW: подпись записи по фракциям (для сравнения дублей).
@@ -1463,6 +1481,10 @@ async def _stmt_confirm_ask(update, context):
         lines.append("📤 Расходы (в журнал):")
         for r in d["exp_rows"]:
             lines.append(f"  • {r['дата']} {r['контрагент'][:22]}: {r['сумма']:.0f}₸ → {r['категория']}")
+    if d.get("pay_rows"):
+        lines.append("💳 Закрою оплату реализаций:")
+        for r in d["pay_rows"]:
+            lines.append(f"  • {r['buyer'][:22]}: {r['сумма']:.0f}₸ (продажа {r['sale_date']} → оплачено {r['pay_date']})")
     notes = []
     if d.get("salary_n"):
         notes.append(f"зарплата пропущена: {d['salary_n']} ({d['salary_sum']:.0f}₸) — ФОТ из ведомости")
@@ -1513,11 +1535,24 @@ async def stmt_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "дата": r["дата"], "сумма": r["сумма"], "группа": r["группа"],
             "категория": r["категория"], "источник": bank,
             "контрагент": r["контрагент"], "примечание": r["примечание"]})
-    if inc_out or d.get("exp_rows"):
+    pay_rows = d.get("pay_rows", [])
+    paid_n = 0
+    if pay_rows:
+        ws_s = await asyncio.to_thread(get_sales_ws)
+        for r in pay_rows:
+            try:
+                await asyncio.to_thread(ws_s.update_cell, r["row"], 10, r["pay_date"])
+                paid_n += 1
+            except Exception as e:
+                logger.error(f"stmt pay mark error (row {r.get('row')}): {e}")
+    if inc_out or d.get("exp_rows") or paid_n:
         schedule_refresh()
-    await update.message.reply_text(
-        f"✅ Из выписки записано: поступлений группы {len(inc_out)}, "
-        f"расходов {len(d.get('exp_rows', []))}. Финотчёт и «Калькуляция» обновятся сами.")
+    msg = (f"✅ Из выписки записано: поступлений группы {len(inc_out)}, "
+           f"расходов {len(d.get('exp_rows', []))}.")
+    if paid_n:
+        msg += f" Закрыто оплат реализаций: {paid_n}."
+    msg += " Финотчёт и «Калькуляция» обновятся сами."
+    await update.message.reply_text(msg)
     return ConversationHandler.END
 async def recognize_daily(image_bytes: bytes):
     """Распознаёт комбинированный дневной отчёт смены: производство + кто работал."""
@@ -1846,7 +1881,9 @@ async def _process_statement_data(update, context, data):
     comps = await asyncio.to_thread(get_group_companies)
     have_inc = await asyncio.to_thread(_income_existing)
     have_exp = await asyncio.to_thread(_expenses_existing)
+    unpaid = await asyncio.to_thread(_unpaid_sales)
     group_rows, inc_other, inc_dups = [], set(), 0
+    pay_rows, used_rows = [], set()
     for s in (data.get("поступления") or []):
         payer = str(s.get("плательщик", "")).strip()
         amt = parse_num(s.get("сумма", 0))
@@ -1856,15 +1893,29 @@ async def _process_statement_data(update, context, data):
         dstr = date_to_str(dt) if dt else ""
         binv = re.sub(r"\D", "", str(s.get("бин", "")))
         comp = _match_group(payer, binv, comps)
-        if comp is None:
+        if comp is not None:
+            if (dstr, _norm_company(payer), round(amt, 2)) in have_inc:
+                inc_dups += 1
+                continue
+            group_rows.append({"дата": dstr, "плательщик": payer, "сумма": amt, "счёт": acct,
+                               "назначение": str(s.get("назначение", "")).strip()[:120],
+                               "бин": binv, "метка": comp["label"]})
+            continue
+        # не компания группы → пробуем закрыть оплату реализации (контрагент + сумма)
+        matched = None
+        for u in unpaid:
+            if u["row"] in used_rows:
+                continue
+            if _norm_company(u["buyer"]) == _norm_company(payer) and round(u["sum"], 2) == round(amt, 2):
+                matched = u
+                break
+        if matched:
+            used_rows.add(matched["row"])
+            pay_rows.append({"row": matched["row"], "buyer": matched["buyer"], "сумма": amt,
+                             "sale_date": matched["date"],
+                             "pay_date": dstr or datetime.now().strftime("%d.%m.%Y")})
+        else:
             inc_other.add(payer)
-            continue
-        if (dstr, _norm_company(payer), round(amt, 2)) in have_inc:
-            inc_dups += 1
-            continue
-        group_rows.append({"дата": dstr, "плательщик": payer, "сумма": amt, "счёт": acct,
-                           "назначение": str(s.get("назначение", "")).strip()[:120],
-                           "бин": binv, "метка": comp["label"]})
     exp_rows, exp_dups, salary_n, salary_sum = [], 0, 0, 0.0
     for s in (data.get("расходы") or []):
         amt = parse_num(s.get("сумма", 0))
@@ -1884,7 +1935,7 @@ async def _process_statement_data(update, context, data):
             continue
         exp_rows.append({"дата": dstr, "сумма": amt, "группа": grp, "категория": cat,
                          "контрагент": rcpt, "примечание": naz[:120]})
-    if not group_rows and not exp_rows:
+    if not group_rows and not exp_rows and not pay_rows:
         msg = "📑 В выписке нового нет."
         ex = []
         if inc_dups or exp_dups:
@@ -1901,7 +1952,7 @@ async def _process_statement_data(update, context, data):
     bank = accounts.get(acct) if acct else None
     context.user_data["pending_stmt"] = {
         "acct": acct, "bank": bank, "group_rows": group_rows, "exp_rows": exp_rows,
-        "inc_dups": inc_dups, "exp_dups": exp_dups, "salary_n": salary_n,
+        "pay_rows": pay_rows, "inc_dups": inc_dups, "exp_dups": exp_dups, "salary_n": salary_n,
         "salary_sum": salary_sum, "inc_other": sorted(inc_other)}
     if not bank:
         kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["❌ Отмена"]],
@@ -1932,7 +1983,7 @@ def _parse_statement_excel(content, is_xls):
         return str(v).strip()
     # наш счёт (ИИК KZ...)
     acct = ""
-    for row in grid[:20]:
+    for row in grid[:25]:
         joined = " ".join(cs(v) for v in row)
         if "иик" in joined.lower():
             m = re.search(r"KZ[0-9A-Z]{15,22}", joined.upper())
@@ -1940,17 +1991,17 @@ def _parse_statement_excel(content, is_xls):
                 acct = m.group(0)
                 break
     if not acct:
-        for row in grid[:20]:
+        for row in grid[:25]:
             m = re.search(r"KZ[0-9A-Z]{15,22}", " ".join(cs(v) for v in row).upper())
             if m:
                 acct = m.group(0)
                 break
-    # строка-заголовок таблицы
+    # строка-заголовок таблицы: ищем строку, где есть и «Дебет», и «Кредит»
     hdr_i, col = None, {}
     for i, row in enumerate(grid):
         low = [cs(v).lower() for v in row]
         joined = " ".join(low)
-        if "дата" in joined and ("дебет" in joined or "кредит" in joined):
+        if "дебет" in joined and "кредит" in joined:
             hdr_i = i
             for j, v in enumerate(low):
                 if v == "дата" and "дата" not in col:
