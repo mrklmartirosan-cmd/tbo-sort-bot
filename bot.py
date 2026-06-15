@@ -82,6 +82,8 @@ DAILY_CONFIRM = 49
 PHOTO_PROD_BYFRAC = 52
 # NEW: статус оплаты продажи — в листе «Реализация» колонка «Оплачено» (дата оплаты)
 (S_PAID, PHOTO_SALE_PAID) = range(53, 55)
+# NEW: отметить оплату продажи кнопкой (Шаг 2)
+(OPL_PICK, OPL_DATE) = range(55, 57)
 FRACTIONS = ["0-1", "1-2", "2-4", "4-6", "6-8"]
 # Заголовки листов склада (порядок колонок = порядок записи)
 PROD_HEADERS = ["Дата", "ФИО оператора", "Вес шин кг", "Мешки шт", "Нитки",
@@ -421,6 +423,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ["📸 Производство", "📄 Реализация"],
         ["✍️ Ввод производства", "✍️ Ввод реализации"],
         ["💸 Ввод расхода", "👷 Смена"],
+        ["💰 Отметить оплату"],
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text(
@@ -714,6 +717,77 @@ async def manual_sale_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _finish_sale_save(update, d)
     context.user_data.pop("sale", None)
     return ConversationHandler.END
+# ---------- Шаг 2: отметить оплату продажи кнопкой ----------
+async def opl_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.message.reply_text("⛔ Нет доступа.")
+        return ConversationHandler.END
+    ws = await asyncio.to_thread(get_sales_ws)
+    rows = await asyncio.to_thread(ws.get_all_values)
+    unpaid = []
+    for i, r in enumerate(rows[1:], start=2):  # 1-based строка листа
+        if len(r) < 10:
+            r = r + [""] * (10 - len(r))
+        buyer = str(r[1]).strip()
+        if str(r[9]).strip():           # колонка J «Оплачено» заполнена — уже оплачено
+            continue
+        if not buyer and not parse_num(r[4]):
+            continue
+        unpaid.append({"row": i, "buyer": buyer or "(без имени)", "date": str(r[0]).strip(),
+                       "sum": parse_num(r[6]), "frac": str(r[3]).strip()})
+    if not unpaid:
+        await update.message.reply_text("✅ Неоплаченных продаж нет — все оплачены.")
+        return ConversationHandler.END
+    unpaid = unpaid[-30:]  # последние 30 неоплаченных
+    mapping, kb_rows = {}, []
+    for n, u in enumerate(unpaid, start=1):
+        mapping[str(n)] = u
+        kb_rows.append([f"{n}. {u['date']} · {u['buyer'][:20]} · {u['sum']:.0f}₸"])
+    kb_rows.append(["❌ Отмена"])
+    context.user_data["opl_map"] = mapping
+    await update.message.reply_text(
+        "💰 Выбери продажу, по которой пришла оплата:",
+        reply_markup=ReplyKeyboardMarkup(kb_rows, resize_keyboard=True, one_time_keyboard=True))
+    return OPL_PICK
+async def opl_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    m = re.match(r"^(\d+)\.", t)
+    mapping = context.user_data.get("opl_map", {})
+    if not m or m.group(1) not in mapping:
+        await update.message.reply_text("Выбери продажу кнопкой из списка (или «❌ Отмена»).")
+        return OPL_PICK
+    context.user_data["opl_chosen"] = mapping[m.group(1)]
+    kb = ReplyKeyboardMarkup([["Сегодня"], ["❌ Отмена"]], resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text(
+        "📅 Какой датой пришла оплата? Нажми «Сегодня» или введи дд.мм.гггг.", reply_markup=kb)
+    return OPL_DATE
+async def opl_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip().lower()
+    if "сегодня" in t:
+        d = datetime.now().strftime("%d.%m.%Y")
+    else:
+        dt = parse_date_or_none(update.message.text)
+        if dt is None:
+            await update.message.reply_text("⚠️ Не понял дату. «Сегодня» или дд.мм.гггг.")
+            return OPL_DATE
+        d = date_to_str(dt)
+    chosen = context.user_data.get("opl_chosen")
+    if not chosen:
+        await update.message.reply_text("Что-то сбилось, начни заново — «💰 Отметить оплату».")
+        return ConversationHandler.END
+    try:
+        ws = await asyncio.to_thread(get_sales_ws)
+        await asyncio.to_thread(ws.update_cell, chosen["row"], 10, d)  # колонка J = 10
+    except Exception as e:
+        logger.error(f"opl update error: {e}")
+        await update.message.reply_text(f"❌ Не смог отметить: {e}")
+        return ConversationHandler.END
+    context.user_data.pop("opl_chosen", None)
+    context.user_data.pop("opl_map", None)
+    await update.message.reply_text(
+        f"✅ Оплата отмечена: {chosen['buyer']} · {chosen['sum']:.0f}₸ · {d}.\n"
+        f"В кабинете долг по этой продаже закроется. Ещё одну — «💰 Отметить оплату».")
+    return ConversationHandler.END
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("prod", None)
     context.user_data.pop("sale", None)
@@ -725,7 +799,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 # «Спасательный круг»: кнопки главного меню (и «❌ Отмена») срабатывают ВСЕГДА,
 # даже посреди незаконченного ввода — сбрасывают его, чтобы бот не залипал.
-MENU_ESCAPE_RE = r"^(📸 Производство|📄 Реализация|✍️ Ввод производства|✍️ Ввод реализации|💸 Ввод расхода|👷 Смена|❌ Отмена)$"
+MENU_ESCAPE_RE = r"^(📸 Производство|📄 Реализация|✍️ Ввод производства|✍️ Ввод реализации|💸 Ввод расхода|👷 Смена|💰 Отметить оплату|❌ Отмена)$"
 async def conv_menu_escape(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for k in ("prod", "sale", "exp", "pending_prod", "pending_sale", "pending_photo",
               "pending_payroll", "pending_tabel_raw", "pending_tabel_period",
@@ -3459,16 +3533,25 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
+    opl_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^💰 Отметить оплату$"), opl_start)],
+        states={
+            OPL_PICK: [MessageHandler(filters.TEXT & ~filters.COMMAND, opl_pick)],
+            OPL_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, opl_date)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
     # «Спасательный круг»: в каждом шаге каждого диалога кнопки меню и «❌ Отмена»
     # обрабатываются первыми — незаконченный ввод сбрасывается, бот не залипает.
     _escape = MessageHandler(filters.Regex(MENU_ESCAPE_RE), conv_menu_escape)
-    for _conv in (prod_conv, sale_conv, exp_conv, photo_conv, smena_conv, xlsx_conv):
+    for _conv in (prod_conv, sale_conv, exp_conv, photo_conv, smena_conv, xlsx_conv, opl_conv):
         for _handlers in _conv.states.values():
             _handlers.insert(0, _escape)
     app.add_handler(prod_conv)
     app.add_handler(sale_conv)
     app.add_handler(exp_conv)
     app.add_handler(smena_conv)
+    app.add_handler(opl_conv)
     app.add_handler(xlsx_conv)
     app.add_handler(photo_conv)  # после exp_conv: фото в режиме «Ввод расхода» ловит exp_conv
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
