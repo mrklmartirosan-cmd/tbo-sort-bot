@@ -186,7 +186,7 @@ def get_worksheet(title, headers):
         ws.append_row(headers, value_input_option="USER_ENTERED")
     return ws
 def get_production_ws():
-    return get_worksheet(SHEET_PRODUCTION, PROD_HEADERS)
+    return get_worksheet(SHEET_PRODUCTION, _prod_headers())
 def get_sales_ws():
     return get_worksheet(SHEET_SALES, SALES_HEADERS)
 def _unpaid_sales():
@@ -295,8 +295,8 @@ def save_sale(data):
     ws.append_row(row, value_input_option="USER_ENTERED")
 # ---------- запись реализации в отчёт "Реализация 2026г" ----------
 def _normalize_fraction(frac_text):
-    for f in FRACTIONS:
-        if f in str(frac_text):
+    for f in _ptypes():
+        if f and f in str(frac_text):
             return f
     return None
 def _get_or_create_month_sheet(sh, dt):
@@ -350,17 +350,18 @@ def write_sale_to_report(data):
     return True, f"добавлено в «{ws.title}», блок «{pay}», строка {target_row}"
 # ---------- Остаток ----------
 def calc_stock():
-    income = {k: 0 for k in FRACTIONS}
+    types = _ptypes()
+    income = {k: 0 for k in types}
     ws_p = get_production_ws()
     rows = ws_p.get_all_values()
     for r in rows[1:]:
-        for i, key in enumerate(FRACTIONS, 5):
+        for i, key in enumerate(types, 5):
             if i < len(r):
                 try:
                     income[key] += float(str(r[i]).replace(",", ".")) if r[i] else 0
                 except Exception:
                     pass
-    outcome = {k: 0 for k in FRACTIONS}
+    outcome = {k: 0 for k in types}
     ws_s = get_sales_ws()
     rows_s = ws_s.get_all_values()
     for r in rows_s[1:]:
@@ -377,6 +378,8 @@ def calc_stock():
     return income, outcome, stock
 # ---------- Распознавание фото через Claude ----------
 async def call_claude(media_b64: str, prompt: str, media_type: str = "image/jpeg"):
+    # подставляем название компании клиента во все промпты (Еділ → без изменений)
+    prompt = prompt.replace("ТОО «Еділ и компания»", _setting("company"))
     if media_type == "application/pdf":
         block = {"type": "document",
                  "source": {"type": "base64", "media_type": "application/pdf", "data": media_b64}}
@@ -422,7 +425,7 @@ async def recognize_production(image_bytes: bytes):
 - На бланке есть итоговое поле «всего крошки» (общий вес за смену в кг).
 - Прочитай это число и верни в "всего_итог" (если два числа — бери нижнее, кг). Если поля нет — 0.
 Если что-то не читается — ставь 0."""
-    return await call_claude(image_b64, prompt)
+    return await call_claude(image_b64, prompt + _recog_note())
 async def recognize_sale(image_bytes: bytes):
     image_b64 = base64.b64encode(image_bytes).decode()
     prompt = """Это фото накладной на отпуск/реализацию резиновой крошки.
@@ -433,6 +436,8 @@ async def recognize_sale(image_bytes: bytes):
 Сумму с НДС бери из колонки "Сумма с НДС" (полная сумма включая НДС).
 Сумму НДС бери из колонки "Сумма НДС" (только НДС). Если НДС в накладной нет — поставь 0.
 Дату верни в виде "дд.мм.гггг". Если не читается — 0."""
+    if not _is_default_domain():
+        prompt += f"\nПоле «фракция» — это вид продукции (например «{_ptype(0)}»), бери как в накладной."
     return await call_claude(image_b64, prompt)
 # ---------- Команды и меню ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -447,7 +452,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text(
-        "👋 Привет! Я бот учёта резиновой крошки.\n\n"
+        f"👋 Привет! Я бот учёта ({_setting('product')}).\n\n"
         "📸 Производство — распознать фото отчёта\n"
         "📄 Реализация — распознать фото накладной\n"
         "✍️ Ввод производства — внести вручную по шагам\n"
@@ -468,9 +473,9 @@ async def ostatok(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_stock = sum(stock.values())
     text = "📦 *ОСТАТОК НА СКЛАДЕ*\n\n"
     text += "```\n"
-    text += f"{'Фракция':<8} {'Приход':>8} {'Расход':>8} {'Остаток':>9}\n"
+    text += f"{'Вид':<8} {'Приход':>8} {'Расход':>8} {'Остаток':>9}\n"
     text += "-" * 37 + "\n"
-    for key in FRACTIONS:
+    for key in _ptypes():
         text += f"{key:<8} {income[key]:>8.0f} {outcome[key]:>8.0f} {stock[key]:>9.0f}\n"
     text += "-" * 37 + "\n"
     text += f"{'ИТОГО':<8} {total_in:>8.0f} {total_out:>8.0f} {total_stock:>9.0f}\n"
@@ -533,23 +538,23 @@ async def manual_prod_tires(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return P_THREAD
 async def manual_prod_thread(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["prod"]["нитки"] = parse_num(update.message.text)
-    await update.message.reply_text("Фракция 0-1, кг?")
+    await update.message.reply_text(f"📦 {_ptype(0)}, кг?")
     return P_F01
 async def manual_prod_f01(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["prod"]["фракция_0_1"] = parse_num(update.message.text)
-    await update.message.reply_text("Фракция 1-2, кг?")
+    await update.message.reply_text(f"📦 {_ptype(1)}, кг?")
     return P_F12
 async def manual_prod_f12(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["prod"]["фракция_1_2"] = parse_num(update.message.text)
-    await update.message.reply_text("Фракция 2-4, кг?")
+    await update.message.reply_text(f"📦 {_ptype(2)}, кг?")
     return P_F24
 async def manual_prod_f24(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["prod"]["фракция_2_4"] = parse_num(update.message.text)
-    await update.message.reply_text("Фракция 4-6, кг?")
+    await update.message.reply_text(f"📦 {_ptype(3)}, кг?")
     return P_F46
 async def manual_prod_f46(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["prod"]["фракция_4_6"] = parse_num(update.message.text)
-    await update.message.reply_text("Фракция 6-8, кг?")
+    await update.message.reply_text(f"📦 {_ptype(4)}, кг?")
     return P_F68
 async def manual_prod_f68(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["prod"]["фракция_6_8"] = parse_num(update.message.text)
@@ -571,12 +576,12 @@ def _prod_summary(d):
         f"👤 Оператор: {d.get('фио', '—')}\n"
         f"⚖️ Вес шин: {d.get('вес_шин', 0)} кг\n"
         f"🛍 Мешки: {bags} шт (всего ÷ 30)\n\n"
-        f"*Фракции (кг):*\n"
-        f"  0-1: {d.get('фракция_0_1', 0)}\n"
-        f"  1-2: {d.get('фракция_1_2', 0)}\n"
-        f"  2-4: {d.get('фракция_2_4', 0)}\n"
-        f"  4-6: {d.get('фракция_4_6', 0)}\n"
-        f"  6-8: {d.get('фракция_6_8', 0)}\n"
+        f"*По видам (кг):*\n"
+        f"  {_ptype(0)}: {d.get('фракция_0_1', 0)}\n"
+        f"  {_ptype(1)}: {d.get('фракция_1_2', 0)}\n"
+        f"  {_ptype(2)}: {d.get('фракция_2_4', 0)}\n"
+        f"  {_ptype(3)}: {d.get('фракция_4_6', 0)}\n"
+        f"  {_ptype(4)}: {d.get('фракция_6_8', 0)}\n"
         f"  Всего: {total} кг\n\n"
         f"🔩 Металлокорд: {d.get('металл_корд', 0)} кг"
     )
@@ -640,12 +645,12 @@ async def manual_sale_paytype(update: Update, context: ContextTypes.DEFAULT_TYPE
         return S_PAYTYPE
     context.user_data["sale"]["тип_расчета"] = pay
     if pay == "Безналичный":
-        kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["⬅️ Назад", "❌ Отмена"]],
+        kb = ReplyKeyboardMarkup([_bank_sources(), ["⬅️ Назад", "❌ Отмена"]],
                                  resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text("🏦 На какой банк придёт оплата?", reply_markup=kb)
         return S_BANK
     await update.message.reply_text(
-        "📦 Фракция? (например: 2-4)\n_Доступны: 0-1, 1-2, 2-4, 4-6, 6-8_",
+        f"📦 Какой вид? (например: {_ptype(0)})\n_Доступны: {', '.join(_ptypes())}_",
         parse_mode="Markdown"
     )
     return S_FRAC
@@ -656,24 +661,21 @@ async def manual_sale_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = ReplyKeyboardMarkup([["Безналичный", "Наличный"], ["❌ Отмена"]], resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text("💳 Тип расчёта? (Безналичный / Наличный)", reply_markup=kb)
         return S_PAYTYPE
-    if "евраз" in val:
-        bank = "Евразийский"
-    elif "бцк" in val or "bcc" in val:
-        bank = "БЦК"
-    else:
-        await update.message.reply_text("⚠️ Выбери: Евразийский или БЦК")
+    bank = _match_bank(val)
+    if not bank:
+        await update.message.reply_text("⚠️ Выбери банк из кнопок: " + ", ".join(_bank_sources()))
         return S_BANK
     context.user_data["sale"]["банк"] = bank
     await update.message.reply_text(
-        "📦 Фракция? (например: 2-4)\n_Доступны: 0-1, 1-2, 2-4, 4-6, 6-8_",
+        f"📦 Какой вид? (например: {_ptype(0)})\n_Доступны: {', '.join(_ptypes())}_",
         parse_mode="Markdown"
     )
     return S_FRAC
 async def manual_sale_frac(update: Update, context: ContextTypes.DEFAULT_TYPE):
     frac = update.message.text.strip()
-    if not any(f in frac for f in FRACTIONS):
+    if not any(f and f in frac for f in _ptypes()):
         await update.message.reply_text(
-            "⚠️ Не распознал фракцию. Введи одну из: 0-1, 1-2, 2-4, 4-6, 6-8"
+            "⚠️ Не распознал вид. Введи один из: " + ", ".join(_ptypes())
         )
         return S_FRAC
     context.user_data["sale"]["фракция"] = frac
@@ -886,7 +888,7 @@ async def photo_sale_paytype(update: Update, context: ContextTypes.DEFAULT_TYPE)
     data = context.user_data.get("pending_sale", {})
     data["тип_расчета"] = pay
     if pay == "Безналичный":
-        kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["⬅️ Назад", "❌ Отмена"]],
+        kb = ReplyKeyboardMarkup([_bank_sources(), ["⬅️ Назад", "❌ Отмена"]],
                                  resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text("🏦 На какой банк придёт оплата?", reply_markup=kb)
         return PHOTO_SALE_BANK
@@ -1015,19 +1017,16 @@ async def payroll_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return PAYROLL_DATE
         d["дата"] = date_to_str(dt)
     if not d.get("банк"):
-        kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["❌ Отмена"]],
+        kb = ReplyKeyboardMarkup([_bank_sources(), ["❌ Отмена"]],
                                  resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text("🏦 С какого банка перечислена зарплата?", reply_markup=kb)
         return PAYROLL_BANK
     return await _payroll_confirm_ask(update, context)
 async def payroll_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     val = update.message.text.strip().lower()
-    if "евраз" in val:
-        bank = "Евразийский"
-    elif "бцк" in val or "bcc" in val:
-        bank = "БЦК"
-    else:
-        await update.message.reply_text("⚠️ Выбери: Евразийский или БЦК")
+    bank = _match_bank(val)
+    if not bank:
+        await update.message.reply_text("⚠️ Выбери банк из кнопок: " + ", ".join(_bank_sources()))
         return PAYROLL_BANK
     context.user_data.get("pending_payroll", {})["банк"] = bank
     return await _payroll_confirm_ask(update, context)
@@ -1407,7 +1406,7 @@ async def _process_statement_rows(update, context, rows):
                                         "unknown": unknown, "dups": dups,
                                         "other": sorted(other)}
     if unknown:
-        kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["❌ Отмена"]],
+        kb = ReplyKeyboardMarkup([_bank_sources(), ["❌ Отмена"]],
                                  resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text(
             f"🏦 Незнакомый счёт получателя:\n{unknown[0]}\nЭто какой наш банк? (запомню навсегда)",
@@ -1416,19 +1415,16 @@ async def _process_statement_rows(update, context, rows):
     return await _vyp_confirm_ask(update, context)
 async def vyp_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     val = update.message.text.strip().lower()
-    if "евраз" in val:
-        bank = "Евразийский"
-    elif "бцк" in val or "bcc" in val:
-        bank = "БЦК"
-    else:
-        await update.message.reply_text("⚠️ Выбери: Евразийский или БЦК")
+    bank = _match_bank(val)
+    if not bank:
+        await update.message.reply_text("⚠️ Выбери банк из кнопок: " + ", ".join(_bank_sources()))
         return VYP_BANK
     d = context.user_data.get("pending_vyp", {})
     acc = d["unknown"].pop(0)
     await asyncio.to_thread(add_account, acc, bank)
     d["accounts"][acc] = bank
     if d["unknown"]:
-        kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["❌ Отмена"]],
+        kb = ReplyKeyboardMarkup([_bank_sources(), ["❌ Отмена"]],
                                  resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text(
             f"🏦 Ещё счёт:\n{d['unknown'][0]}\nКакой банк?", reply_markup=kb)
@@ -1507,12 +1503,9 @@ async def _stmt_confirm_ask(update, context):
     return STMT_CONFIRM
 async def stmt_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     val = update.message.text.strip().lower()
-    if "евраз" in val:
-        bank = "Евразийский"
-    elif "бцк" in val or "bcc" in val:
-        bank = "БЦК"
-    else:
-        await update.message.reply_text("⚠️ Выбери: Евразийский или БЦК")
+    bank = _match_bank(val)
+    if not bank:
+        await update.message.reply_text("⚠️ Выбери банк из кнопок: " + ", ".join(_bank_sources()))
         return STMT_BANK
     d = context.user_data.get("pending_stmt", {})
     d["bank"] = bank
@@ -1590,7 +1583,7 @@ async def recognize_daily(image_bytes: bytes):
         "«всего_итог» — из строки «ВСЕГО крошки, кг». В «работали» — только заполненные строки "
         "таблицы (часы числом: 8, 10, 12). Чего нет на бланке — 0 или пусто."
     )
-    return await call_claude(image_b64, prompt)
+    return await call_claude(image_b64, prompt + _recog_note())
 async def daily_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ans = update.message.text.strip().lower()
     d = context.user_data.pop("pending_daily", None) or {}
@@ -1736,12 +1729,9 @@ async def photo_sale_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = ReplyKeyboardMarkup([["Безналичный", "Наличный"], ["❌ Отмена"]], resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text("💳 Тип расчёта? (Безналичный / Наличный)", reply_markup=kb)
         return PHOTO_SALE_PAY
-    if "евраз" in val:
-        bank = "Евразийский"
-    elif "бцк" in val or "bcc" in val:
-        bank = "БЦК"
-    else:
-        await update.message.reply_text("⚠️ Выбери: Евразийский или БЦК")
+    bank = _match_bank(val)
+    if not bank:
+        await update.message.reply_text("⚠️ Выбери банк из кнопок: " + ", ".join(_bank_sources()))
         return PHOTO_SALE_BANK
     data = context.user_data.get("pending_sale", {})
     data["банк"] = bank
@@ -1787,6 +1777,9 @@ async def detect_doc_type(image_bytes: bytes):
         'Верни ТОЛЬКО JSON: {"тип":"реализация"} или {"тип":"производство"} или {"тип":"расход"} '
         'или {"тип":"ведомость"} или {"тип":"табель"} или {"тип":"дневной"} или {"тип":"выписка"}.'
     )
+    if not _is_default_domain():
+        prompt += (f"\nКонтекст: компания производит «{_setting('product')}» из «{_setting('raw')}»; "
+                   f"«производство» — это отчёт по {_setting('product')}, «реализация» — продажа {_setting('product')}.")
     try:
         res = await call_claude(image_b64, prompt)
         t = str(res.get("тип", "")).strip().lower() if isinstance(res, dict) else ""
@@ -1995,7 +1988,7 @@ async def _stmt_next_step(update, context):
     """Шаги выписки по очереди: банк → неизвестные счета ФОТ → карточка-подтверждение."""
     d = context.user_data.get("pending_stmt", {})
     if not d.get("bank"):
-        kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["❌ Отмена"]],
+        kb = ReplyKeyboardMarkup([_bank_sources(), ["❌ Отмена"]],
                                  resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text(
             f"🏦 Счёт {d.get('acct') or '(не распознан)'} незнаком. Это какой наш банк? (запомню)",
@@ -2212,8 +2205,7 @@ async def _dispatch_photo(update, context, photo_type, image_bytes, media_type="
                         f"= {round(aup + prod)}, а «Итого» на бланке {round(total)}. Проверь внимательно!")
             period = _norm_period(str(data.get("месяц", "")))
             bank_raw = str(data.get("банк", "")).lower()
-            bank = ("Евразийский" if "евраз" in bank_raw
-                    else "БЦК" if ("бцк" in bank_raw or "центркредит" in bank_raw) else "")
+            bank = _match_bank(bank_raw) or ""
             # таблица накопительная: сравниваем с уже внесённым, добавляем только дельту
             have = await asyncio.to_thread(_payroll_already_entered, period)
             targets = [("ФОТ производственный", "Производство", prod),
@@ -2271,7 +2263,7 @@ async def _dispatch_photo(update, context, photo_type, image_bytes, media_type="
             # тип расчёта распознан с фото: банк (для безнала) + доспрос недостающего
             context.user_data["pending_sale"] = data
             if data["тип_расчета"] == "Безналичный":
-                kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["⬅️ Назад", "❌ Отмена"]],
+                kb = ReplyKeyboardMarkup([_bank_sources(), ["⬅️ Назад", "❌ Отмена"]],
                                          resize_keyboard=True, one_time_keyboard=True)
                 await update.message.reply_text("🏦 На какой банк придёт оплата?", reply_markup=kb)
                 return PHOTO_SALE_BANK
@@ -2540,12 +2532,140 @@ EXPENSE_GROUPS = {
 EXPENSE_SOURCES = ["Евразийский", "БЦК", "Касса 1", "Касса 2", "Неденежный"]
 def get_expenses_ws():
     return get_worksheet(SHEET_EXPENSES, EXPENSE_HEADERS)
+# --- Настройки клиента (лист «Настройки») — каркас «коробки» ---
+# Лист НЕ создаётся автоматически: нет листа (как у Еділ) → значения по умолчанию.
+SETTINGS_DEFAULTS = {
+    "company": "ТОО «Еділ и компания»",
+    "brand": "Еділ",
+    "product": "резиновая крошка",
+    "raw": "шины",
+    "unit": "кг",
+    "product_types": "0-1, 1-2, 2-4, 4-6, 6-8",
+    "sources": "Евразийский, БЦК, Касса 1, Касса 2, Неденежный",
+}
+_settings_cache = None
+def get_settings(force=False):
+    """Читает лист «Настройки» (Параметр | Значение). Любая ошибка/нет листа → значения по умолчанию.
+    Лист не создаём (чтобы не трогать таблицу Еділ). Результат кэшируется на время работы."""
+    global _settings_cache
+    if _settings_cache is not None and not force:
+        return _settings_cache
+    s = dict(SETTINGS_DEFAULTS)
+    raw = {}
+    try:
+        ws = get_spreadsheet().worksheet("Настройки")
+        for r in ws.get_all_values():
+            if len(r) >= 2 and str(r[0]).strip() and str(r[1]).strip():
+                raw[str(r[0]).strip().lower()] = str(r[1]).strip()
+    except Exception:
+        _settings_cache = s
+        return s
+    def find(*subs):
+        for k, v in raw.items():
+            if any(sub in k for sub in subs):
+                return v
+        return None
+    mapping = {
+        "company": ("название компании", "компани"),
+        "brand": ("бренд",),
+        "product": ("что производим", "продукт"),
+        "raw": ("на входе", "сырь"),
+        "unit": ("единиц",),
+        "product_types": ("виды продукции", "виды вторсырья", "фракци"),
+        "sources": ("источники денег", "источники"),
+    }
+    for key, subs in mapping.items():
+        v = find(*subs)
+        if v:
+            s[key] = v
+    _settings_cache = s
+    return s
+def _setting(key):
+    return get_settings().get(key, SETTINGS_DEFAULTS.get(key, ""))
+def _setting_list(key):
+    return [x.strip() for x in str(_setting(key)).split(",") if x.strip()]
+_DEFAULT_PTYPES = ["0-1", "1-2", "2-4", "4-6", "6-8"]
+def _ptypes():
+    """Виды продукции из «Настроек» (для Еділ — фракции 0-1…6-8). До 5 штук (5 слотов формы)."""
+    p = _setting_list("product_types")
+    return p if p else list(_DEFAULT_PTYPES)
+def _ptype(i):
+    p = _ptypes()
+    if i < len(p):
+        return p[i]
+    return _DEFAULT_PTYPES[i] if i < len(_DEFAULT_PTYPES) else f"вид {i + 1}"
+def _is_default_domain():
+    return _ptypes() == _DEFAULT_PTYPES and _setting("product") == SETTINGS_DEFAULTS["product"]
+def _recog_note():
+    """Приписка к промптам распознавания производства для дочки (Еділ → пусто)."""
+    if _is_default_domain():
+        return ""
+    slots = ["фракция_0_1", "фракция_1_2", "фракция_2_4", "фракция_4_6", "фракция_6_8"]
+    types = _ptypes()
+    pairs = "; ".join(f"{slots[i]} = «{types[i]}»" for i in range(min(len(types), 5)))
+    return (f"\nВАЖНО: это производство «{_setting('product')}» из «{_setting('raw')}». "
+            f"Вместо фракций на бланке — ВИДЫ ПРОДУКЦИИ. Сопоставь по порядку: {pairs}. "
+            f"Значения (кг) клади в соответствующие поля фракция_*. «всего_итог» — общий вес всех видов.")
+def _prod_headers():
+    """Заголовки листа «Производство» с учётом видов из «Настроек» (Еділ → как было).
+    Применяются только при создании нового листа (у существующей таблицы Еділ не меняются)."""
+    t = _ptypes()
+    def lab(i):
+        return t[i] if i < len(t) else _DEFAULT_PTYPES[i]
+    return ["Дата", "ФИО оператора", f"Вес {_setting('raw')} кг", "Мешки шт", "Нитки",
+            lab(0), lab(1), lab(2), lab(3), lab(4),
+            f"Всего {_setting('product')} кг", "Металлокорд кг", "Примечание"]
+def _money_sources():
+    return _setting_list("sources") or ["Евразийский", "БЦК", "Касса 1", "Касса 2", "Неденежный"]
+def _bank_sources():
+    b = [x for x in _money_sources() if "касса" not in x.lower() and "неденеж" not in x.lower()]
+    return b or ["Евразийский", "БЦК"]
+def _cash_sources():
+    return [x for x in _money_sources() if "касса" in x.lower()]
+def _source_kb_rows():
+    rows = [_bank_sources()]
+    if _cash_sources():
+        rows.append(_cash_sources())
+    rows.append(["Неденежный"])
+    return rows
+def _match_bank(text):
+    """Сопоставляет ответ пользователя с банком-безналом из «Настроек» (или Евразийский/БЦК)."""
+    t = str(text).strip().lower()
+    for b in _bank_sources():
+        bl = b.lower()
+        if bl == t or bl in t or t in bl:
+            return b
+    if "евраз" in t:
+        return "Евразийский"
+    if "бцк" in t or "bcc" in t or "центркредит" in t or "centercredit" in t:
+        return "БЦК"
+    return None
+_exp_rules_cache = None
+def _expense_rules():
+    """Правила категорий из листа «Категории» (ключевое слово | группа | статья).
+    Нет листа (как у Еділ) → пустой список → работают встроенные правила."""
+    global _exp_rules_cache
+    if _exp_rules_cache is not None:
+        return _exp_rules_cache
+    rules = []
+    try:
+        for r in get_spreadsheet().worksheet("Категории").get_all_values()[1:]:
+            if len(r) >= 3 and str(r[0]).strip() and str(r[2]).strip():
+                rules.append((str(r[0]).strip().lower(), str(r[1]).strip(), str(r[2]).strip()))
+    except Exception:
+        rules = []
+    _exp_rules_cache = rules
+    return rules
 def _categorize_expense(naznachenie):
     """По назначению платежа из выписки -> (группа, категория, is_salary).
     is_salary=True -> зарплата, её ПРОПУСКАЕМ (ФОТ берём из ведомости)."""
     n = str(naznachenie).lower()
     if any(k in n for k in ("картсчет", "карт-счет", "заработн", "зароботн", "зарплат", "сотрудник")):
         return (None, None, True)
+    # пользовательские правила из листа «Категории» (если есть) — приоритетнее встроенных
+    for kw, grp, cat in _expense_rules():
+        if kw and kw in n:
+            return (grp or "Прочее", cat, False)
     if "комисси" in n:
         return ("Администрация", "Услуги банка", False)
     if any(k in n for k in ("такси", "транспорт", "перевозк", "логист", "сухопутн", "доставк")):
@@ -2627,9 +2747,9 @@ def _fot_registry_add(iik, fio, ftype):
     except Exception as e:
         logger.error(f"fot_registry_add: {e}")
 def _source_to_paytype(src):
-    if src in ("Евразийский", "БЦК"):
+    if src in _bank_sources():
         return "Безналичный"
-    if src in ("Касса 1", "Касса 2"):
+    if src in _cash_sources():
         return "Наличный"
     return "Неденежный"
 def save_expense(data):
@@ -2821,7 +2941,7 @@ async def manual_exp_category(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data["exp"]["категория"] = cat
     if context.user_data["exp"].get("источник"):
         return await _ask_note(update, context)
-    kb = ReplyKeyboardMarkup([["Евразийский", "БЦК"], ["Касса 1", "Касса 2"], ["Неденежный"], ["⬅️ Назад", "❌ Отмена"]],
+    kb = ReplyKeyboardMarkup(_source_kb_rows() + [["⬅️ Назад", "❌ Отмена"]],
                              resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text("🏦 Источник (откуда оплата)?", reply_markup=kb)
     return E_SOURCE
@@ -2833,7 +2953,7 @@ async def manual_exp_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                  resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text("🏷 Категория?", reply_markup=kb)
         return E_CATEGORY
-    if src not in EXPENSE_SOURCES:
+    if src not in _money_sources():
         await update.message.reply_text("⚠️ Выбери источник кнопкой. Или ⬅️ Назад / ❌ Отмена.")
         return E_SOURCE
     context.user_data["exp"]["источник"] = src
@@ -2940,10 +3060,9 @@ async def _exp_from_photo_data(update, context, data):
         "примечание": str(data.get("назначение", "")).strip()[:120],
     }
     bank_raw = str(data.get("банк", "")).lower()
-    if "евраз" in bank_raw:
-        context.user_data["exp"]["источник"] = "Евразийский"
-    elif "центркредит" in bank_raw or "бцк" in bank_raw or "centercredit" in bank_raw:
-        context.user_data["exp"]["источник"] = "БЦК"
+    _src = _match_bank(bank_raw)
+    if _src:
+        context.user_data["exp"]["источник"] = _src
     d = context.user_data["exp"]
     await update.message.reply_text(
         f"💸 Распознал:\n💵 Сумма: {d['сумма']} тнг\n🏢 Контрагент: {d['контрагент'] or '—'}\n📅 Дата: {d['дата']}"
@@ -3138,7 +3257,7 @@ async def cmd_svod(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"«Свод расходов» — расходы по категориям; «Себестоимость (авто)» — производство, расходы, полная себестоимость, выручка, прибыль и себестоимость 1 кг по месяцам."
     )
 # --- Запись себестоимости в файл экономиста («Калькуляция себестоимости») ---
-SEBES_FILE_ID = "1ZKYCFVKrb0l-mzYQ0gtiHKOJbTNHd9TcJ9hN9i5RiFk"
+SEBES_FILE_ID = os.environ.get("SEBES_FILE_ID", "1ZKYCFVKrb0l-mzYQ0gtiHKOJbTNHd9TcJ9hN9i5RiFk")
 KALK_SHEET = "Калькуляция себестоимости"
 RU_MONTHS_FULL = {1: "январь", 2: "февраль", 3: "март", 4: "апрель", 5: "май", 6: "июнь",
                   7: "июль", 8: "август", 9: "сентябрь", 10: "октябрь", 11: "ноябрь", 12: "декабрь"}
